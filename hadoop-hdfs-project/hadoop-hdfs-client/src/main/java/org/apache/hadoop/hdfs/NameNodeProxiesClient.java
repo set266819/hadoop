@@ -35,8 +35,8 @@ import org.apache.hadoop.ipc.AlignmentContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.hadoop.thirdparty.com.google.common.annotations.VisibleForTesting;
-import org.apache.hadoop.thirdparty.com.google.common.base.Preconditions;
+import org.apache.hadoop.classification.VisibleForTesting;
+import org.apache.hadoop.util.Preconditions;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hdfs.client.HdfsClientConfigKeys;
@@ -77,11 +77,6 @@ public class NameNodeProxiesClient {
 
   private static final Logger LOG = LoggerFactory.getLogger(
       NameNodeProxiesClient.class);
-
-  /** Maximum # of retries for HAProxy with HAServiceProtocol. */
-  private static final int MAX_RETRIES = 3;
-  /** Initial retry delay for HAProxy with HAServiceProtocol. */
-  private static final int DELAY_MILLISECONDS = 200;
 
   /**
    * Wrapper for a client proxy as well as its associated service ID.
@@ -354,6 +349,12 @@ public class NameNodeProxiesClient {
       boolean withRetries, AtomicBoolean fallbackToSimpleAuth,
       AlignmentContext alignmentContext)
       throws IOException {
+    if (alignmentContext == null &&
+        conf.getBoolean(HdfsClientConfigKeys.DFS_RBF_OBSERVER_READ_ENABLE,
+            HdfsClientConfigKeys.DFS_RBF_OBSERVER_READ_ENABLE_DEFAULT)) {
+      alignmentContext = new ClientGSIContext();
+    }
+
     RPC.setProtocolEngine(conf, ClientNamenodeProtocolPB.class,
         ProtobufRpcEngine2.class);
 

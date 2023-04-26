@@ -44,7 +44,6 @@ import java.util.TreeMap;
 import java.util.concurrent.locks.ReentrantLock;
 
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
-import org.apache.commons.io.IOUtils;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.BatchedRemoteIterator.BatchedListEntries;
@@ -83,17 +82,19 @@ import org.apache.hadoop.hdfs.server.namenode.startupprogress.StartupProgress.Co
 import org.apache.hadoop.hdfs.server.namenode.startupprogress.Step;
 import org.apache.hadoop.hdfs.server.namenode.startupprogress.StepType;
 import org.apache.hadoop.hdfs.util.ReadOnlyList;
+import org.apache.hadoop.io.IOUtils;
 import org.apache.hadoop.security.AccessControlException;
 import org.apache.hadoop.util.GSet;
 import org.apache.hadoop.util.LightWeightGSet;
+import org.apache.hadoop.util.Lists;
 import org.apache.hadoop.util.Time;
+
+import org.apache.hadoop.classification.VisibleForTesting;
+import org.apache.hadoop.thirdparty.com.google.common.collect.HashMultimap;
+import org.apache.hadoop.thirdparty.com.google.common.collect.Multimap;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import org.apache.hadoop.thirdparty.com.google.common.annotations.VisibleForTesting;
-import org.apache.hadoop.thirdparty.com.google.common.collect.HashMultimap;
-import org.apache.hadoop.thirdparty.com.google.common.collect.Lists;
-import org.apache.hadoop.thirdparty.com.google.common.collect.Multimap;
 
 /**
  * The Cache Manager handles caching on DataNodes.
@@ -280,7 +281,7 @@ public class CacheManager {
       if (this.monitor != null) {
         CacheReplicationMonitor prevMonitor = this.monitor;
         this.monitor = null;
-        IOUtils.closeQuietly(prevMonitor);
+        IOUtils.closeStream(prevMonitor);
       }
     } finally {
       crmLock.unlock();
@@ -975,9 +976,8 @@ public class CacheManager {
   public final void processCacheReport(final DatanodeID datanodeID,
       final List<Long> blockIds) throws IOException {
     if (!enabled) {
-      LOG.debug("Ignoring cache report from {} because {} = false. " +
-              "number of blocks: {}", datanodeID,
-              DFS_NAMENODE_CACHING_ENABLED_KEY, blockIds.size());
+      LOG.debug("Ignoring cache report from {} because {} = false. number of blocks: {}",
+          datanodeID, DFS_NAMENODE_CACHING_ENABLED_KEY, blockIds.size());
       return;
     }
     namesystem.writeLock();
@@ -1002,9 +1002,8 @@ public class CacheManager {
     if (metrics != null) {
       metrics.addCacheBlockReport((int) (endTime - startTime));
     }
-    LOG.debug("Processed cache report from {}, blocks: {}, " +
-        "processing time: {} msecs", datanodeID, blockIds.size(), 
-        (endTime - startTime));
+    LOG.debug("Processed cache report from {}, blocks: {}, processing time: {} msecs",
+        datanodeID, blockIds.size(), (endTime - startTime));
   }
 
   private void processCacheReportImpl(final DatanodeDescriptor datanode,

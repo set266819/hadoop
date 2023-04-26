@@ -17,14 +17,19 @@
 package org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.converter;
 
 import static org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacitySchedulerConfiguration.PREFIX;
+import static org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacitySchedulerConfiguration.USER_LIMIT_FACTOR;
 import static org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.converter.FSConfigToCSConfigRuleHandler.DYNAMIC_MAX_ASSIGN;
 import static org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.converter.FSConfigToCSConfigRuleHandler.MAX_CAPACITY_PERCENTAGE;
 import static org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.converter.FSConfigToCSConfigRuleHandler.MAX_CHILD_CAPACITY;
 import static org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.converter.FSConfigToCSConfigRuleHandler.QUEUE_AUTO_CREATE;
 import static org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.converter.FSConfigToCSConfigRuleHandler.RESERVATION_SYSTEM;
-import static org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.converter.FSConfigToCSConfigRuleHandler.SPECIFIED_NOT_FIRST;
-import static org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.converter.FSConfigToCSConfigRuleHandler.USER_MAX_APPS_DEFAULT;
-import static org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.converter.FSConfigToCSConfigRuleHandler.USER_MAX_RUNNING_APPS;
+import static org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.converter.FSConfigToCSConfigRuleHandler.CHILD_STATIC_DYNAMIC_CONFLICT;
+import static org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.converter.FSConfigToCSConfigRuleHandler.PARENT_CHILD_CREATE_DIFFERS;
+import static org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.converter.FSConfigToCSConfigRuleHandler.FAIR_AS_DRF;
+import static org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.converter.FSConfigToCSConfigRuleHandler.MAX_RESOURCES;
+import static org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.converter.FSConfigToCSConfigRuleHandler.MIN_RESOURCES;
+import static org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.converter.FSConfigToCSConfigRuleHandler.PARENT_DYNAMIC_CREATE;
+
 import static org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.converter.FSConfigToCSConfigRuleHandler.RuleAction.ABORT;
 import static org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.converter.FSConfigToCSConfigRuleHandler.RuleAction.WARNING;
 import static org.junit.Assert.assertEquals;
@@ -32,6 +37,7 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyZeroInteractions;
 
@@ -177,7 +183,30 @@ public class TestFSConfigToCSConfigConverter {
         conf.get(PREFIX + "root.admins.alice.maximum-am-resource-percent"));
 
     assertNull("root.users.joe maximum-am-resource-percent should be null",
-        conf.get(PREFIX + "root.users.joe maximum-am-resource-percent"));
+        conf.get(PREFIX + "root.users.joe.maximum-am-resource-percent"));
+  }
+
+  @Test
+  public void testDefaultUserLimitFactor() throws Exception {
+    converter.convert(config);
+
+    Configuration conf = converter.getCapacitySchedulerConfig();
+
+    assertNull("root.users user-limit-factor should be null",
+            conf.get(PREFIX + "root.users." + USER_LIMIT_FACTOR));
+    assertEquals("root.users auto-queue-creation-v2.enabled", "true",
+            conf.get(PREFIX + "root.users.auto-queue-creation-v2.enabled"));
+
+    assertEquals("root.default user-limit-factor", "-1.0",
+            conf.get(PREFIX + "root.default.user-limit-factor"));
+
+    assertEquals("root.users.joe user-limit-factor", "-1.0",
+            conf.get(PREFIX + "root.users.joe.user-limit-factor"));
+
+    assertEquals("root.admins.bob user-limit-factor", "-1.0",
+            conf.get(PREFIX + "root.admins.bob.user-limit-factor"));
+    assertNull("root.admin.bob auto-queue-creation-v2.enabled should be null",
+            conf.get(PREFIX + "root.admin.bob.auto-queue-creation-v2.enabled"));
   }
 
   @Test
@@ -392,14 +421,8 @@ public class TestFSConfigToCSConfigConverter {
         ABORT, actions.get(MAX_CAPACITY_PERCENTAGE));
     assertEquals("maxChildCapacity",
         ABORT, actions.get(MAX_CHILD_CAPACITY));
-    assertEquals("userMaxRunningApps",
-        ABORT, actions.get(USER_MAX_RUNNING_APPS));
-    assertEquals("userMaxAppsDefault",
-        ABORT, actions.get(USER_MAX_APPS_DEFAULT));
     assertEquals("dynamicMaxAssign",
         ABORT, actions.get(DYNAMIC_MAX_ASSIGN));
-    assertEquals("specifiedNotFirstRule",
-        ABORT, actions.get(SPECIFIED_NOT_FIRST));
     assertEquals("reservationSystem",
         ABORT, actions.get(RESERVATION_SYSTEM));
     assertEquals("queueAutoCreate",
@@ -427,18 +450,24 @@ public class TestFSConfigToCSConfigConverter {
         WARNING, actions.get(MAX_CAPACITY_PERCENTAGE));
     assertEquals("maxChildCapacity",
         WARNING, actions.get(MAX_CHILD_CAPACITY));
-    assertEquals("userMaxRunningApps",
-        WARNING, actions.get(USER_MAX_RUNNING_APPS));
-    assertEquals("userMaxAppsDefault",
-        WARNING, actions.get(USER_MAX_APPS_DEFAULT));
     assertEquals("dynamicMaxAssign",
         WARNING, actions.get(DYNAMIC_MAX_ASSIGN));
-    assertEquals("specifiedNotFirstRule",
-        WARNING, actions.get(SPECIFIED_NOT_FIRST));
     assertEquals("reservationSystem",
         WARNING, actions.get(RESERVATION_SYSTEM));
     assertEquals("queueAutoCreate",
         WARNING, actions.get(QUEUE_AUTO_CREATE));
+    assertEquals("childStaticDynamicConflict",
+        WARNING, actions.get(CHILD_STATIC_DYNAMIC_CONFLICT));
+    assertEquals("parentChildCreateDiffers",
+        WARNING, actions.get(PARENT_CHILD_CREATE_DIFFERS));
+    assertEquals("fairAsDrf",
+        WARNING, actions.get(FAIR_AS_DRF));
+    assertEquals("maxResources",
+        WARNING, actions.get(MAX_RESOURCES));
+    assertEquals("minResources",
+        WARNING, actions.get(MIN_RESOURCES));
+    assertEquals("parentDynamicCreate",
+        WARNING, actions.get(PARENT_DYNAMIC_CREATE));
   }
 
   @Test
@@ -661,7 +690,10 @@ public class TestFSConfigToCSConfigConverter {
     verify(placementConverter).convertPlacementPolicy(
         any(PlacementManager.class),
         any(FSConfigToCSConfigRuleHandler.class),
-        any(CapacitySchedulerConfiguration.class));
+        any(CapacitySchedulerConfiguration.class),
+        anyBoolean());
+    assertTrue(converter.getCapacitySchedulerConfig().getBoolean(
+        CapacitySchedulerConfiguration.ENABLE_QUEUE_MAPPING_OVERRIDE, false));
   }
 
   @Test
@@ -677,6 +709,21 @@ public class TestFSConfigToCSConfigConverter {
     assertEquals("Asynchronous scheduling should be the default value",
             CapacitySchedulerConfiguration.DEFAULT_SCHEDULE_ASYNCHRONOUSLY_ENABLE,
             schedulingEnabledValue);
+  }
+
+  @Test
+  public void testSiteDisabledPreemptionWithObserveOnlyConversion()
+      throws Exception{
+    FSConfigToCSConfigConverterParams params = createDefaultParamsBuilder()
+        .withDisablePreemption(FSConfigToCSConfigConverterParams.
+            PreemptionMode.OBSERVE_ONLY)
+        .build();
+
+    converter.convert(params);
+    assertTrue("The observe only should be true",
+        converter.getCapacitySchedulerConfig().
+            getBoolean(CapacitySchedulerConfiguration.
+                PREEMPTION_OBSERVE_ONLY, false));
   }
 
   private boolean testConversionWithAsyncSchedulingOption(boolean enabled) throws Exception {

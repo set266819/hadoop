@@ -64,10 +64,9 @@
   <build>
     <plugins>
       <plugin>
-        <groupId>org.codehaus.mojo</groupId>
-        <artifactId>findbugs-maven-plugin</artifactId>
+        <groupId>com.github.spotbugs</groupId>
+        <artifactId>spotbugs-maven-plugin</artifactId>
         <configuration>
-          <findbugsXmlOutput>true</findbugsXmlOutput>
           <xmlOutput>true</xmlOutput>
           <excludeFilterFile>${basedir}/dev-support/findbugs-exclude.xml
           </excludeFilterFile>
@@ -110,7 +109,7 @@
     <dependency>
       <groupId>com.qcloud</groupId>
       <artifactId>cos_api-bundle</artifactId>
-      <version>5.6.19</version>
+      <version>5.6.69</version>
       <scope>compile</scope>
     </dependency>
 

@@ -56,6 +56,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.Random;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CountDownLatch;
@@ -99,6 +100,7 @@ import org.apache.hadoop.yarn.api.records.NodeId;
 import org.apache.hadoop.yarn.api.records.Priority;
 import org.apache.hadoop.yarn.api.records.Resource;
 import org.apache.hadoop.yarn.api.records.URL;
+import org.apache.hadoop.yarn.api.records.ContainerExitStatus;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
 import org.apache.hadoop.yarn.event.DrainDispatcher;
 import org.apache.hadoop.yarn.event.Event;
@@ -141,6 +143,7 @@ import org.apache.hadoop.yarn.server.nodemanager.executor.DeletionAsUserContext;
 import org.apache.hadoop.yarn.server.utils.BuilderUtils;
 import org.apache.hadoop.yarn.util.ConverterUtils;
 import org.apache.hadoop.yarn.util.Records;
+import org.apache.hadoop.yarn.util.resource.Resources;
 import org.junit.Assert;
 import org.junit.Test;
 import org.mockito.ArgumentCaptor;
@@ -205,7 +208,9 @@ public class TestLogAggregationService extends BaseContainerManagerTest {
     logAggregationService.init(this.conf);
     logAggregationService.start();
 
-    ApplicationId application1 = BuilderUtils.newApplicationId(1234, 1);
+    Random random = new Random(System.currentTimeMillis());
+    long clusterTimeStamp = random.nextLong();
+    ApplicationId application1 = BuilderUtils.newApplicationId(clusterTimeStamp, 1);
 
     // AppLogDir should be created
     File app1LogDir =
@@ -233,31 +238,41 @@ public class TestLogAggregationService extends BaseContainerManagerTest {
     // ensure filesystems were closed
     verify(logAggregationService).closeFileSystems(
         any(UserGroupInformation.class));
-    List<Path> dirList = new ArrayList<>();
-    dirList.add(new Path(app1LogDir.toURI()));
-    verify(delSrvc, times(2)).delete(argThat(new FileDeletionMatcher(
-        delSrvc, user, null, dirList)));
-    
-    String containerIdStr = container11.toString();
-    File containerLogDir = new File(app1LogDir, containerIdStr);
-    int count = 0;
-    int maxAttempts = 50;
-    for (String fileType : new String[] { "stdout", "stderr", "syslog" }) {
-      File f = new File(containerLogDir, fileType);
-      count = 0;
-      while ((f.exists()) && (count < maxAttempts)) {
-        count++;
-        Thread.sleep(100);
+    boolean filesShouldBeDeleted =
+        this.conf.getBoolean(YarnConfiguration.LOG_AGGREGATION_ENABLE_LOCAL_CLEANUP,
+            YarnConfiguration.DEFAULT_LOG_AGGREGATION_ENABLE_LOCAL_CLEANUP);
+    if (filesShouldBeDeleted) {
+      List<Path> dirList = new ArrayList<>();
+      dirList.add(new Path(app1LogDir.toURI()));
+      verify(delSrvc, times(2)).delete(argThat(new FileDeletionMatcher(
+          delSrvc, user, null, dirList)));
+
+      String containerIdStr = container11.toString();
+      File containerLogDir = new File(app1LogDir, containerIdStr);
+      for (String fileType : new String[]{"stdout", "stderr", "syslog"}) {
+        File f = new File(containerLogDir, fileType);
+        GenericTestUtils.waitFor(() -> !f.exists(), 1000, 1000 * 50);
+        Assert.assertFalse("File [" + f + "] was not deleted", f.exists());
       }
-      Assert.assertFalse("File [" + f + "] was not deleted", f.exists());
+      Assert.assertFalse("Directory [" + app1LogDir + "] was not deleted",
+          app1LogDir.exists());
+    } else {
+      List<Path> dirList = new ArrayList<>();
+      dirList.add(new Path(app1LogDir.toURI()));
+      verify(delSrvc, never()).delete(argThat(new FileDeletionMatcher(
+          delSrvc, user, null, dirList)));
+
+      String containerIdStr = container11.toString();
+      File containerLogDir = new File(app1LogDir, containerIdStr);
+      Thread.sleep(5000);
+      for (String fileType : new String[]{"stdout", "stderr", "syslog"}) {
+        File f = new File(containerLogDir, fileType);
+        Assert.assertTrue("File [" + f + "] was not deleted", f.exists());
+      }
+      Assert.assertTrue("Directory [" + app1LogDir + "] was not deleted",
+          app1LogDir.exists());
     }
-    count = 0;
-    while ((app1LogDir.exists()) && (count < maxAttempts)) {
-      count++;
-      Thread.sleep(100);
-    }
-    Assert.assertFalse("Directory [" + app1LogDir + "] was not deleted",
-      app1LogDir.exists());
+    delSrvc.stop();
 
     Path logFilePath = logAggregationService
         .getLogAggregationFileController(conf)
@@ -293,6 +308,20 @@ public class TestLogAggregationService extends BaseContainerManagerTest {
     LogAggregationService logAggregationService = spy(
         new LogAggregationService(dispatcher, this.context, this.delSrvc,
                                   super.dirsHandler));
+    verifyLocalFileDeletion(logAggregationService);
+  }
+
+  @Test
+  public void testLocalFileRemainsAfterUploadOnCleanupDisable() throws Exception {
+    this.delSrvc = new DeletionService(createContainerExecutor());
+    delSrvc = spy(delSrvc);
+    this.delSrvc.init(conf);
+    this.conf.setBoolean(YarnConfiguration.LOG_AGGREGATION_ENABLE_LOCAL_CLEANUP, false);
+    this.conf.set(YarnConfiguration.NM_LOG_DIRS, localLogDir.getAbsolutePath());
+    this.conf.set(YarnConfiguration.NM_REMOTE_APP_LOG_DIR,
+        this.remoteRootLogDir.getAbsolutePath());
+    LogAggregationService logAggregationService = spy(
+        new LogAggregationService(dispatcher, this.context, this.delSrvc, super.dirsHandler));
     verifyLocalFileDeletion(logAggregationService);
   }
 
@@ -1870,6 +1899,35 @@ public class TestLogAggregationService extends BaseContainerManagerTest {
 
   @Test (timeout = 50000)
   @SuppressWarnings("unchecked")
+  public void testLimitSizeContainerLogAggregationPolicy() throws Exception {
+    ApplicationId appId = createApplication();
+    LogAggregationService logAggregationService = createLogAggregationService(
+        appId, LimitSizeContainerLogAggregationPolicy.class, null);
+
+    String[] logFiles = new String[] {"stdout" };
+    // exitCode KILLED_FOR_EXCESS_LOGS
+    finishContainer(
+        appId, logAggregationService, ContainerType.APPLICATION_MASTER, 1,
+        ContainerExitStatus.KILLED_FOR_EXCESS_LOGS,
+        logFiles);
+    ContainerId container2 =
+        finishContainer(appId, logAggregationService, ContainerType.TASK, 2, 0,
+        logFiles);
+    ContainerId container3 =
+        finishContainer(appId, logAggregationService, ContainerType.TASK, 3,
+        ContainerExecutor.ExitCode.FORCE_KILLED.getExitCode(), logFiles);
+
+    finishApplication(appId, logAggregationService);
+
+    verifyContainerLogs(logAggregationService, appId,
+        new ContainerId[] {container2, container3},
+        logFiles, 2, false, EMPTY_FILES);
+
+    verifyLogAggFinishEvent(appId);
+  }
+
+  @Test (timeout = 50000)
+  @SuppressWarnings("unchecked")
   public void testAMOrFailedContainerPolicy() throws Exception {
     ApplicationId appId = createApplication();
     LogAggregationService logAggregationService = createLogAggregationService(
@@ -2236,7 +2294,7 @@ public class TestLogAggregationService extends BaseContainerManagerTest {
       long cId, ContainerType containerType) {
     ContainerId containerId = BuilderUtils.newContainerId(appAttemptId1,
         cId);
-    Resource r = BuilderUtils.newResource(1024, 1);
+    Resource r = Resources.createResource(1024);
     ContainerTokenIdentifier containerToken = new ContainerTokenIdentifier(
         containerId, context.getNodeId().toString(), user, r,
         System.currentTimeMillis() + 100000L, 123, DUMMY_RM_IDENTIFIER,

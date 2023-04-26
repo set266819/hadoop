@@ -16,19 +16,21 @@
  * limitations under the License.
  */
 
-#include "mock_connection.h"
-
-#include "datatransfer.pb.h"
-#include "common/util.h"
-#include "common/cancel_tracker.h"
 #include "reader/block_reader.h"
 #include "reader/datatransfer.h"
+
+#include "mock_connection.h"
+
+#include "common/util.h"
+#include "common/cancel_tracker.h"
 #include "reader/fileinfo.h"
 
 #include <google/protobuf/io/coded_stream.h>
 #include <google/protobuf/io/zero_copy_stream_impl.h>
-#include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include <gmock/gmock.h>
+#include <gmock/gmock-spec-builders.h>
+#include <gmock/gmock-generated-actions.h>
 #include <boost/system/error_code.hpp>
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/io_service.hpp>
@@ -117,16 +119,16 @@ static inline string ToDelimitedString(const pb::MessageLite *msg) {
   res.reserve(hdfs::DelimitedPBMessageSize(msg));
   pbio::StringOutputStream os(&res);
   pbio::CodedOutputStream out(&os);
-  out.WriteVarint32(msg->ByteSize());
+  out.WriteVarint64(msg->ByteSizeLong());
   msg->SerializeToCodedStream(&out);
   return res;
 }
 
-static inline std::pair<error_code, string> Produce(const std::string &s) {
-  return make_pair(error_code(), s);
+static inline std::pair<boost::system::error_code, string> Produce(const std::string &s) {
+  return make_pair(boost::system::error_code(), s);
 }
 
-static inline std::pair<error_code, string> ProducePacket(
+static inline std::pair<boost::system::error_code, string> ProducePacket(
     const std::string &data, const std::string &checksum, int offset_in_block,
     int seqno, bool last_packet) {
   PacketHeaderProto proto;
@@ -139,14 +141,14 @@ static inline std::pair<error_code, string> ProducePacket(
   *reinterpret_cast<unsigned *>(prefix) =
       htonl(data.size() + checksum.size() + sizeof(int32_t));
   *reinterpret_cast<short *>(prefix + sizeof(int32_t)) =
-      htons(proto.ByteSize());
+      htons(static_cast<uint16_t>(proto.ByteSizeLong()));
   std::string payload(prefix, sizeof(prefix));
-  payload.reserve(payload.size() + proto.ByteSize() + checksum.size() +
+  payload.reserve(payload.size() + proto.ByteSizeLong() + checksum.size() +
                   data.size());
   proto.AppendToString(&payload);
   payload += checksum;
   payload += data;
-  return std::make_pair(error_code(), std::move(payload));
+  return std::make_pair(boost::system::error_code(), std::move(payload));
 }
 
 TEST(RemoteBlockReaderTest, TestReadSingleTrunk) {
@@ -165,8 +167,10 @@ TEST(RemoteBlockReaderTest, TestReadSingleTrunk) {
   EXPECT_CALL(reader, AsyncReadPacket(_, _))
       .WillOnce(InvokeArgument<1>(Status::OK(), sizeof(buf)));
 
+  const auto client_name = GetRandomClientName();
+  ASSERT_NE(client_name, nullptr);
   reader.AsyncReadBlock(
-       GetRandomClientName(), block, 0, boost::asio::buffer(buf, sizeof(buf)),
+       *client_name, block, 0, boost::asio::buffer(buf, sizeof(buf)),
       [&stat, &read](const Status &status, size_t transferred) {
         stat = status;
         read = transferred;
@@ -192,8 +196,10 @@ TEST(RemoteBlockReaderTest, TestReadMultipleTrunk) {
       .Times(4)
       .WillRepeatedly(InvokeArgument<1>(Status::OK(), sizeof(buf) / 4));
 
+  const auto client_name = GetRandomClientName();
+  ASSERT_NE(client_name, nullptr);
   reader.AsyncReadBlock(
-       GetRandomClientName(), block, 0, boost::asio::buffer(buf, sizeof(buf)),
+       *client_name, block, 0, boost::asio::buffer(buf, sizeof(buf)),
       [&stat, &read](const Status &status, size_t transferred) {
         stat = status;
         read = transferred;
@@ -220,8 +226,10 @@ TEST(RemoteBlockReaderTest, TestReadError) {
       .WillOnce(InvokeArgument<1>(Status::OK(), sizeof(buf) / 4))
       .WillOnce(InvokeArgument<1>(Status::Error("error"), 0));
 
+  const auto client_name = GetRandomClientName();
+  ASSERT_NE(client_name, nullptr);
   reader.AsyncReadBlock(
-       GetRandomClientName(), block, 0, boost::asio::buffer(buf, sizeof(buf)),
+       *client_name, block, 0, boost::asio::buffer(buf, sizeof(buf)),
       [&stat, &read](const Status &status, size_t transferred) {
         stat = status;
         read = transferred;

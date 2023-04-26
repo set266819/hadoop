@@ -60,7 +60,7 @@ import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNodeImpl;
 import org.apache.hadoop.yarn.util.Clock;
 import org.apache.hadoop.yarn.util.SystemClock;
 
-import org.apache.hadoop.thirdparty.com.google.common.annotations.VisibleForTesting;
+import org.apache.hadoop.classification.VisibleForTesting;
 
 @SuppressWarnings("unchecked")
 public class NodesListManager extends CompositeService implements
@@ -85,6 +85,7 @@ public class NodesListManager extends CompositeService implements
   private Timer removalTimer;
   private int nodeRemovalCheckInterval;
   private Set<RMNode> gracefulDecommissionableNodes;
+  private boolean enableNodeUntrackedWithoutIncludePath;
 
   public NodesListManager(RMContext rmContext) {
     super(NodesListManager.class.getName());
@@ -124,6 +125,9 @@ public class NodesListManager extends CompositeService implements
       disableHostsFileReader(ioe);
     }
 
+    enableNodeUntrackedWithoutIncludePath = conf.getBoolean(
+        YarnConfiguration.RM_ENABLE_NODE_UNTRACKED_WITHOUT_INCLUDE_PATH,
+        YarnConfiguration.DEFAULT_RM_ENABLE_NODE_UNTRACKED_WITHOUT_INCLUDE_PATH);
     final int nodeRemovalTimeout =
         conf.getInt(
             YarnConfiguration.RM_NODEMANAGER_UNTRACKED_REMOVAL_TIMEOUT_MSEC,
@@ -509,12 +513,8 @@ public class NodesListManager extends CompositeService implements
       RMNode eventNode, RMAppNodeUpdateType appNodeUpdateType) {
     for(RMApp app : rmContext.getRMApps().values()) {
       if (!app.isAppFinalStateStored()) {
-        this.rmContext
-            .getDispatcher()
-            .getEventHandler()
-            .handle(
-                new RMAppNodeUpdateEvent(app.getApplicationId(), eventNode,
-                    appNodeUpdateType));
+        app.handle(new RMAppNodeUpdateEvent(app.getApplicationId(), eventNode,
+            appNodeUpdateType));
       }
     }
   }
@@ -609,18 +609,21 @@ public class NodesListManager extends CompositeService implements
     Set<String> hostsList = hostDetails.getIncludedHosts();
     Set<String> excludeList = hostDetails.getExcludedHosts();
 
-    return !hostsList.isEmpty() && !hostsList.contains(hostName)
+    return (!hostsList.isEmpty() || (enableNodeUntrackedWithoutIncludePath
+          && (hostDetails.getIncludesFile() == null
+              || hostDetails.getIncludesFile().isEmpty())))
+        && !hostsList.contains(hostName)
         && !hostsList.contains(ip) && !excludeList.contains(hostName)
         && !excludeList.contains(ip);
   }
 
   /**
-   * Refresh the nodes gracefully
+   * Refresh the nodes gracefully.
    *
-   * @param yarnConf
+   * @param yarnConf yarn configuration.
    * @param timeout decommission timeout, null means default timeout.
-   * @throws IOException
-   * @throws YarnException
+   * @throws IOException io error occur.
+   * @throws YarnException exceptions from yarn servers.
    */
   public void refreshNodesGracefully(Configuration yarnConf, Integer timeout)
       throws IOException, YarnException {
@@ -682,6 +685,9 @@ public class NodesListManager extends CompositeService implements
   /**
    * A NodeId instance needed upon startup for populating inactive nodes Map.
    * It only knows the hostname/ip and marks the port to -1 or invalid.
+   *
+   * @param host host name.
+   * @return node id.
    */
   public static NodeId createUnknownNodeId(String host) {
     return NodeId.newInstance(host, -1);

@@ -17,12 +17,13 @@
  */
 package org.apache.hadoop.hdfs.server.datanode;
 
-import org.apache.hadoop.thirdparty.com.google.common.annotations.VisibleForTesting;
+import org.apache.hadoop.classification.VisibleForTesting;
 
 import org.apache.hadoop.classification.InterfaceAudience;
 
 import java.io.FileNotFoundException;
 import java.io.IOException;
+import java.nio.ByteBuffer;
 
 /**
  * Used for injecting faults in DFSClient and DFSOutputStream tests.
@@ -68,6 +69,12 @@ public class DataNodeFaultInjector {
   }
 
   /**
+   * Used as a hook to delay sending the response of the last packet.
+   */
+  public void delayAckLastPacket() throws IOException {
+  }
+
+  /**
    * Used as a hook to delay writing a packet to disk.
    */
   public void delayWriteToDisk() {}
@@ -107,6 +114,12 @@ public class DataNodeFaultInjector {
   public void stripedBlockReconstruction() throws IOException {}
 
   /**
+   * Used as a hook to inject failure in erasure coding checksum reconstruction
+   * process.
+   */
+  public void stripedBlockChecksumReconstruction() throws IOException {}
+
+  /**
    * Used as a hook to inject latency when read block
    * in erasure coding reconstruction process.
    */
@@ -131,4 +144,22 @@ public class DataNodeFaultInjector {
    * Used as a hook to inject intercept when re-register.
    */
   public void blockUtilSendFullBlockReport() {}
+
+  /**
+   * Just delay a while.
+   */
+  public void delay() {}
+
+  /**
+   * Used as a hook to inject data pollution
+   * into an erasure coding reconstruction.
+   */
+  public void badDecoding(ByteBuffer[] outputs) {}
+
+  public void markSlow(String dnAddr, int[] replies) {}
+
+  /**
+   * Just delay delete replica a while.
+   */
+  public void delayDeleteReplica() {}
 }

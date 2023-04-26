@@ -19,6 +19,7 @@
 package org.apache.hadoop.yarn.server.resourcemanager.placement;
 
 import org.apache.hadoop.thirdparty.com.google.common.collect.ImmutableSet;
+import org.apache.hadoop.yarn.server.resourcemanager.placement.csmappingrule.MappingRuleConditionalVariable;
 
 import java.util.Arrays;
 import java.util.HashMap;
@@ -38,6 +39,14 @@ public class VariableContext {
    * This is our actual variable store.
    */
   private Map<String, String> variables = new HashMap<>();
+  private Map<String, String> originalVariables = new HashMap<>();
+
+  /**
+   * This is our conditional variable store.
+   */
+  private Map<String, MappingRuleConditionalVariable> conditionalVariables =
+      new HashMap<>();
+
   /**
    * This set contains the names of the immutable variables if null it is
    * ignored.
@@ -55,7 +64,7 @@ public class VariableContext {
    * @param name Name of the variable to check
    * @return true if the variable is immutable
    */
-  boolean isImmutable(String name) {
+  public boolean isImmutable(String name) {
     return (immutableNames != null && immutableNames.contains(name));
   }
 
@@ -106,7 +115,33 @@ public class VariableContext {
       throw new IllegalStateException(
           "Variable '" + name + "' is immutable, cannot update it's value!");
     }
+
+    if (conditionalVariables.containsKey(name)) {
+      throw new IllegalStateException(
+          "Variable '" + name + "' is already defined as a conditional" +
+              " variable, cannot change it's value!");
+    }
     variables.put(name, value);
+    return this;
+  }
+
+  public void putOriginal(String name, String value) {
+    originalVariables.put(name, value);
+  }
+
+  /**
+   * This method is used to add a conditional variable to the variable context.
+   * @param name Name of the variable
+   * @param variable The conditional variable evaluator
+   * @return VariableContext for daisy chaining
+   */
+  public VariableContext putConditional(String name,
+      MappingRuleConditionalVariable variable) {
+    if (conditionalVariables.containsKey(name)) {
+      throw new IllegalStateException(
+          "Variable '" + name + "' is conditional, cannot update it's value!");
+    }
+    conditionalVariables.put(name, variable);
     return this;
   }
 
@@ -118,6 +153,10 @@ public class VariableContext {
   public String get(String name) {
     String ret = variables.get(name);
     return ret == null ? "" : ret;
+  }
+
+  public String getOriginal(String name) {
+    return originalVariables.get(name);
   }
 
   /**
@@ -140,6 +179,7 @@ public class VariableContext {
   /**
    * Returns the dataset referenced by the name.
    * @param name Name of the set to be returned.
+   * @return the dataset referenced by the name.
    */
   public Set<String> getExtraDataset(String name) {
     return extraDataset.get(name);
@@ -213,10 +253,21 @@ public class VariableContext {
 
     String[] parts = input.split("\\.");
     for (int i = 0; i < parts.length; i++) {
-      //if the part is a variable it should be in the map, otherwise we keep
-      //it's original value. This means undefined variables will return the
-      //name of the variable, but this is working as intended.
-      String newVal = variables.getOrDefault(parts[i], parts[i]);
+      String newVal = parts[i];
+      //if the part is a variable it should be in either the variable or the
+      //conditional variable map, otherwise we keep it's original value.
+      //This means undefined variables will return the name of the variable,
+      //but this is working as intended.
+      if (variables.containsKey(parts[i])) {
+        newVal = variables.get(parts[i]);
+      } else if (conditionalVariables.containsKey(parts[i])) {
+        MappingRuleConditionalVariable condVariable =
+            conditionalVariables.get(parts[i]);
+        if (condVariable != null) {
+          newVal = condVariable.evaluateInPath(parts, i);
+        }
+      }
+
       //if a variable's value is null, we use empty string instead
       if (newVal == null) {
         newVal = "";

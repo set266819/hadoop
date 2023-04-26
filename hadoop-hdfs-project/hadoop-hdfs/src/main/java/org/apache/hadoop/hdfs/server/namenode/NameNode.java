@@ -17,15 +17,14 @@
  */
 package org.apache.hadoop.hdfs.server.namenode;
 
-import org.apache.hadoop.thirdparty.com.google.common.annotations.VisibleForTesting;
+import org.apache.commons.lang3.ArrayUtils;
+import org.apache.commons.lang3.tuple.Pair;
+import org.apache.hadoop.classification.VisibleForTesting;
+import org.apache.hadoop.ipc.CallerContext;
 import org.apache.hadoop.thirdparty.com.google.common.base.Joiner;
-import org.apache.hadoop.thirdparty.com.google.common.base.Preconditions;
-import org.apache.hadoop.thirdparty.com.google.common.collect.Lists;
-import org.apache.hadoop.thirdparty.com.google.common.collect.Sets;
+import org.apache.hadoop.util.Preconditions;
 
 import java.util.Set;
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.HadoopIllegalArgumentException;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.conf.Configuration;
@@ -88,18 +87,20 @@ import org.apache.hadoop.security.SecurityUtil;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.security.authorize.RefreshAuthorizationPolicyProtocol;
 import org.apache.hadoop.tools.GetUserMappingsProtocol;
-import org.apache.hadoop.tracing.TraceAdminProtocol;
 import org.apache.hadoop.tracing.TraceUtils;
-import org.apache.hadoop.tracing.TracerConfigurationManager;
 import org.apache.hadoop.util.ExitUtil.ExitException;
 import org.apache.hadoop.util.GenericOptionsParser;
 import org.apache.hadoop.util.JvmPauseMonitor;
+import org.apache.hadoop.util.Lists;
 import org.apache.hadoop.util.ServicePlugin;
+import org.apache.hadoop.util.Sets;
 import org.apache.hadoop.util.StringUtils;
 import org.apache.hadoop.util.Time;
 import org.apache.hadoop.util.GcTimeMonitor;
 import org.apache.hadoop.util.GcTimeMonitor.Builder;
-import org.apache.htrace.core.Tracer;
+import org.apache.hadoop.tracing.Tracer;
+import org.apache.hadoop.util.Timer;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -123,8 +124,15 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.FS_DEFAULT_NAME_KEY;
 import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.FS_TRASH_INTERVAL_DEFAULT;
 import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.FS_TRASH_INTERVAL_KEY;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_BLOCK_INVALIDATE_LIMIT_KEY;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_DATANODE_MAX_NODES_TO_REPORT_DEFAULT;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_DATANODE_MAX_NODES_TO_REPORT_KEY;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_DATANODE_PEER_STATS_ENABLED_DEFAULT;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_DATANODE_PEER_STATS_ENABLED_KEY;
 import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_HA_NN_NOT_BECOME_ACTIVE_IN_SAFEMODE;
 import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_HA_NN_NOT_BECOME_ACTIVE_IN_SAFEMODE_DEFAULT;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_IMAGE_PARALLEL_LOAD_DEFAULT;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_IMAGE_PARALLEL_LOAD_KEY;
 import static org.apache.hadoop.hdfs.client.HdfsClientConfigKeys.DFS_NAMENODE_RPC_PORT_DEFAULT;
 import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.HADOOP_CALLER_CONTEXT_ENABLED_KEY;
 import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.HADOOP_CALLER_CONTEXT_ENABLED_DEFAULT;
@@ -187,6 +195,18 @@ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_GC_TIME_MONITOR_
 import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_GC_TIME_MONITOR_ENABLE_DEFAULT;
 import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_BLOCK_REPLICATOR_CLASSNAME_KEY;
 import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_BLOCK_PLACEMENT_EC_CLASSNAME_KEY;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_AVOID_SLOW_DATANODE_FOR_READ_KEY;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_AVOID_SLOW_DATANODE_FOR_READ_DEFAULT;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_BLOCKPLACEMENTPOLICY_EXCLUDE_SLOW_NODES_ENABLED_KEY;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_BLOCKPLACEMENTPOLICY_EXCLUDE_SLOW_NODES_ENABLED_DEFAULT;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_MAX_SLOWPEER_COLLECT_NODES_KEY;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_MAX_SLOWPEER_COLLECT_NODES_DEFAULT;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_RECONSTRUCTION_PENDING_TIMEOUT_SEC_KEY;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_RECONSTRUCTION_PENDING_TIMEOUT_SEC_DEFAULT;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_DECOMMISSION_BACKOFF_MONITOR_PENDING_LIMIT;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_DECOMMISSION_BACKOFF_MONITOR_PENDING_LIMIT_DEFAULT;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_DECOMMISSION_BACKOFF_MONITOR_PENDING_BLOCKS_PER_LOCK;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_DECOMMISSION_BACKOFF_MONITOR_PENDING_BLOCKS_PER_LOCK_DEFAULT;
 
 import static org.apache.hadoop.util.ExitUtil.terminate;
 import static org.apache.hadoop.util.ToolRunner.confirmPrompt;
@@ -327,7 +347,17 @@ public class NameNode extends ReconfigurableBase implements
           DFS_NAMENODE_REPLICATION_STREAMS_HARD_LIMIT_KEY,
           DFS_NAMENODE_REPLICATION_WORK_MULTIPLIER_PER_ITERATION,
           DFS_BLOCK_REPLICATOR_CLASSNAME_KEY,
-          DFS_BLOCK_PLACEMENT_EC_CLASSNAME_KEY));
+          DFS_BLOCK_PLACEMENT_EC_CLASSNAME_KEY,
+          DFS_IMAGE_PARALLEL_LOAD_KEY,
+          DFS_NAMENODE_AVOID_SLOW_DATANODE_FOR_READ_KEY,
+          DFS_NAMENODE_BLOCKPLACEMENTPOLICY_EXCLUDE_SLOW_NODES_ENABLED_KEY,
+          DFS_NAMENODE_MAX_SLOWPEER_COLLECT_NODES_KEY,
+          DFS_BLOCK_INVALIDATE_LIMIT_KEY,
+          DFS_DATANODE_PEER_STATS_ENABLED_KEY,
+          DFS_DATANODE_MAX_NODES_TO_REPORT_KEY,
+          DFS_NAMENODE_RECONSTRUCTION_PENDING_TIMEOUT_SEC_KEY,
+          DFS_NAMENODE_DECOMMISSION_BACKOFF_MONITOR_PENDING_LIMIT,
+          DFS_NAMENODE_DECOMMISSION_BACKOFF_MONITOR_PENDING_BLOCKS_PER_LOCK));
 
   private static final String USAGE = "Usage: hdfs namenode ["
       + StartupOption.BACKUP.getName() + "] | \n\t["
@@ -372,8 +402,6 @@ public class NameNode extends ReconfigurableBase implements
       return RefreshCallQueueProtocol.versionID;
     } else if (protocol.equals(GetUserMappingsProtocol.class.getName())){
       return GetUserMappingsProtocol.versionID;
-    } else if (protocol.equals(TraceAdminProtocol.class.getName())){
-      return TraceAdminProtocol.versionID;
     } else {
       throw new IOException("Unknown protocol to name node: " + protocol);
     }
@@ -385,7 +413,6 @@ public class NameNode extends ReconfigurableBase implements
    */
   @Deprecated
   public static final int DEFAULT_PORT = DFS_NAMENODE_RPC_PORT_DEFAULT;
-  public static final String FS_HDFS_IMPL_KEY = "fs.hdfs.impl";
   public static final Logger LOG =
       LoggerFactory.getLogger(NameNode.class.getName());
   public static final Logger stateChangeLog =
@@ -398,8 +425,7 @@ public class NameNode extends ReconfigurableBase implements
 
   private static final String NAMENODE_HTRACE_PREFIX = "namenode.htrace.";
 
-  public static final Log MetricsLog =
-      LogFactory.getLog("NameNodeMetricsLog");
+  public static final String METRICS_LOG_NAME = "NameNodeMetricsLog";
 
   protected FSNamesystem namesystem; 
   protected final NamenodeRole role;
@@ -428,7 +454,6 @@ public class NameNode extends ReconfigurableBase implements
   private GcTimeMonitor gcTimeMonitor;
   private ObjectName nameNodeStatusBeanName;
   protected final Tracer tracer;
-  protected final TracerConfigurationManager tracerConfigurationManager;
   ScheduledThreadPoolExecutor metricsLoggerTimer;
 
   /**
@@ -476,6 +501,97 @@ public class NameNode extends ReconfigurableBase implements
 
   public static NameNodeMetrics getNameNodeMetrics() {
     return metrics;
+  }
+
+  /**
+   * Try to obtain the actual client info according to the current user.
+   * @param ipProxyUsers Users who can override client infos
+   */
+  private static String clientInfoFromContext(
+      final String[] ipProxyUsers) {
+    if (ipProxyUsers != null) {
+      UserGroupInformation user =
+          UserGroupInformation.getRealUserOrSelf(Server.getRemoteUser());
+      if (user != null &&
+          ArrayUtils.contains(ipProxyUsers, user.getShortUserName())) {
+        CallerContext context = CallerContext.getCurrent();
+        if (context != null && context.isContextValid()) {
+          return context.getContext();
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Try to obtain the value corresponding to the key by parsing the content.
+   * @param content the full content to be parsed.
+   * @param key trying to obtain the value of the key.
+   * @return the value corresponding to the key.
+   */
+  @VisibleForTesting
+  public static String parseSpecialValue(String content, String key) {
+    int posn = content.indexOf(key);
+    if (posn != -1) {
+      posn += key.length();
+      int end = content.indexOf(",", posn);
+      return end == -1 ? content.substring(posn)
+          : content.substring(posn, end);
+    }
+    return null;
+  }
+
+  /**
+   * Try to obtain the actual client's machine according to the current user.
+   * @param ipProxyUsers Users who can override client infos.
+   * @return The actual client's machine.
+   */
+  public static String getClientMachine(final String[] ipProxyUsers) {
+    String clientMachine = null;
+    String cc = clientInfoFromContext(ipProxyUsers);
+    if (cc != null) {
+      // if the rpc has a caller context of "clientIp:1.2.3.4,CLI",
+      // return "1.2.3.4" as the client machine.
+      String key = CallerContext.CLIENT_IP_STR +
+          CallerContext.Builder.KEY_VALUE_SEPARATOR;
+      clientMachine = parseSpecialValue(cc, key);
+    }
+
+    if (clientMachine == null) {
+      clientMachine = Server.getRemoteAddress();
+      if (clientMachine == null) { //not a RPC client
+        clientMachine = "";
+      }
+    }
+    return clientMachine;
+  }
+
+  /**
+   * Try to obtain the actual client's id and call id
+   * according to the current user.
+   * @param ipProxyUsers Users who can override client infos
+   * @return The actual client's id and call id.
+   */
+  public static Pair<byte[], Integer> getClientIdAndCallId(
+      final String[] ipProxyUsers) {
+    byte[] clientId = Server.getClientId();
+    int callId = Server.getCallId();
+    String cc = clientInfoFromContext(ipProxyUsers);
+    if (cc != null) {
+      String clientIdKey = CallerContext.CLIENT_ID_STR +
+          CallerContext.Builder.KEY_VALUE_SEPARATOR;
+      String clientIdStr = parseSpecialValue(cc, clientIdKey);
+      if (clientIdStr != null) {
+        clientId = StringUtils.hexStringToByte(clientIdStr);
+      }
+      String callIdKey = CallerContext.CLIENT_CALL_ID_STR +
+          CallerContext.Builder.KEY_VALUE_SEPARATOR;
+      String callIdStr = parseSpecialValue(cc, callIdKey);
+      if (callIdStr != null) {
+        callId = Integer.parseInt(callIdStr);
+      }
+    }
+    return Pair.of(clientId, callId);
   }
 
   /**
@@ -830,13 +946,11 @@ public class NameNode extends ReconfigurableBase implements
       return;
     }
 
-    MetricsLoggerTask.makeMetricsLoggerAsync(MetricsLog);
-
     // Schedule the periodic logging.
     metricsLoggerTimer = new ScheduledThreadPoolExecutor(1);
     metricsLoggerTimer.setExecuteExistingDelayedTasksAfterShutdownPolicy(
         false);
-    metricsLoggerTimer.scheduleWithFixedDelay(new MetricsLoggerTask(MetricsLog,
+    metricsLoggerTimer.scheduleWithFixedDelay(new MetricsLoggerTask(METRICS_LOG_NAME,
         "NameNode", (short) 128),
         metricsLoggerPeriodSec,
         metricsLoggerPeriodSec,
@@ -997,8 +1111,6 @@ public class NameNode extends ReconfigurableBase implements
     this.tracer = new Tracer.Builder("NameNode").
         conf(TraceUtils.wrapHadoopConf(NAMENODE_HTRACE_PREFIX, conf)).
         build();
-    this.tracerConfigurationManager =
-        new TracerConfigurationManager(NAMENODE_HTRACE_PREFIX, conf);
     this.role = role;
     String nsId = getNameServiceId(conf);
     String namenodeId = HAUtil.getNameNodeId(conf, nsId);
@@ -1249,8 +1361,9 @@ public class NameNode extends ReconfigurableBase implements
     LOG.info("Formatting using clusterid: {}", clusterId);
     
     FSImage fsImage = new FSImage(conf, nameDirsToFormat, editDirsToFormat);
+    FSNamesystem fsn = null;
     try {
-      FSNamesystem fsn = new FSNamesystem(conf, fsImage);
+      fsn = new FSNamesystem(conf, fsImage);
       fsImage.getEditLog().initJournalsForWrite();
 
       // Abort NameNode format if reformat is disabled and if
@@ -1275,8 +1388,14 @@ public class NameNode extends ReconfigurableBase implements
       fsImage.format(fsn, clusterId, force);
     } catch (IOException ioe) {
       LOG.warn("Encountered exception during format", ioe);
-      fsImage.close();
       throw ioe;
+    } finally {
+      if (fsImage != null) {
+        fsImage.close();
+      }
+      if (fsn != null) {
+        fsn.close();
+      }
     }
     return false;
   }
@@ -1832,9 +1951,9 @@ public class NameNode extends ReconfigurableBase implements
     }
   }
 
-  synchronized void monitorHealth() 
-      throws HealthCheckFailedException, AccessControlException {
-    namesystem.checkSuperuserPrivilege();
+  synchronized void monitorHealth() throws IOException {
+    String operationName = "monitorHealth";
+    namesystem.checkSuperuserPrivilege(operationName);
     if (!haEnabled) {
       return; // no-op, if HA is not enabled
     }
@@ -1856,9 +1975,9 @@ public class NameNode extends ReconfigurableBase implements
     }
   }
   
-  synchronized void transitionToActive() 
-      throws ServiceFailedException, AccessControlException {
-    namesystem.checkSuperuserPrivilege();
+  synchronized void transitionToActive() throws IOException {
+    String operationName = "transitionToActive";
+    namesystem.checkSuperuserPrivilege(operationName);
     if (!haEnabled) {
       throw new ServiceFailedException("HA for namenode is not enabled");
     }
@@ -1873,18 +1992,21 @@ public class NameNode extends ReconfigurableBase implements
     state.setState(haContext, ACTIVE_STATE);
   }
 
-  synchronized void transitionToStandby()
-      throws ServiceFailedException, AccessControlException {
-    namesystem.checkSuperuserPrivilege();
+  synchronized void transitionToStandby() throws IOException {
+    String operationName = "transitionToStandby";
+    namesystem.checkSuperuserPrivilege(operationName);
     if (!haEnabled) {
       throw new ServiceFailedException("HA for namenode is not enabled");
     }
     state.setState(haContext, STANDBY_STATE);
   }
 
-  synchronized void transitionToObserver()
-      throws ServiceFailedException, AccessControlException {
-    namesystem.checkSuperuserPrivilege();
+  synchronized void transitionToObserver() throws IOException {
+    String operationName = "transitionToObserver";
+    namesystem.checkSuperuserPrivilege(operationName);
+    if (notBecomeActiveInSafemode && isInSafeMode()) {
+      throw new ServiceFailedException(getRole() + " still not leave safemode");
+    }
     if (!haEnabled) {
       throw new ServiceFailedException("HA for namenode is not enabled");
     }
@@ -2018,9 +2140,7 @@ public class NameNode extends ReconfigurableBase implements
     public void startActiveServices() throws IOException {
       try {
         namesystem.startActiveServices();
-        if (namesystem.isSnapshotTrashRootEnabled()) {
-          namesystem.checkAndProvisionSnapshotTrashRoots();
-        }
+        namesystem.checkAndProvisionSnapshotTrashRoots();
         startTrashEmptier(getConf());
       } catch (Throwable t) {
         doImmediateShutdown(t);
@@ -2078,7 +2198,7 @@ public class NameNode extends ReconfigurableBase implements
     @Override
     public void writeUnlock() {
       namesystem.unlockRetryCache();
-      namesystem.writeUnlock();
+      namesystem.writeUnlock("HAState");
     }
     
     /** Check if an operation of given category is allowed */
@@ -2188,12 +2308,27 @@ public class NameNode extends ReconfigurableBase implements
     } else if (property.equals(DFS_NAMENODE_REPLICATION_MAX_STREAMS_KEY)
         || property.equals(DFS_NAMENODE_REPLICATION_STREAMS_HARD_LIMIT_KEY)
         || property.equals(
-            DFS_NAMENODE_REPLICATION_WORK_MULTIPLIER_PER_ITERATION)) {
+            DFS_NAMENODE_REPLICATION_WORK_MULTIPLIER_PER_ITERATION)
+        || property.equals(DFS_NAMENODE_RECONSTRUCTION_PENDING_TIMEOUT_SEC_KEY)) {
       return reconfReplicationParameters(newVal, property);
     } else if (property.equals(DFS_BLOCK_REPLICATOR_CLASSNAME_KEY) || property
         .equals(DFS_BLOCK_PLACEMENT_EC_CLASSNAME_KEY)) {
       reconfBlockPlacementPolicy();
       return newVal;
+    } else if (property.equals(DFS_IMAGE_PARALLEL_LOAD_KEY)) {
+      return reconfigureParallelLoad(newVal);
+    } else if (property.equals(DFS_NAMENODE_AVOID_SLOW_DATANODE_FOR_READ_KEY) || (property.equals(
+        DFS_NAMENODE_BLOCKPLACEMENTPOLICY_EXCLUDE_SLOW_NODES_ENABLED_KEY)) || (property.equals(
+        DFS_NAMENODE_MAX_SLOWPEER_COLLECT_NODES_KEY)) || (property.equals(
+        DFS_DATANODE_PEER_STATS_ENABLED_KEY)) || property.equals(
+        DFS_DATANODE_MAX_NODES_TO_REPORT_KEY)) {
+      return reconfigureSlowNodesParameters(datanodeManager, property, newVal);
+    } else if (property.equals(DFS_BLOCK_INVALIDATE_LIMIT_KEY)) {
+      return reconfigureBlockInvalidateLimit(datanodeManager, property, newVal);
+    } else if (property.equals(DFS_NAMENODE_DECOMMISSION_BACKOFF_MONITOR_PENDING_LIMIT) ||
+        (property.equals(DFS_NAMENODE_DECOMMISSION_BACKOFF_MONITOR_PENDING_BLOCKS_PER_LOCK))) {
+      return reconfigureDecommissionBackoffMonitorParameters(datanodeManager, property,
+          newVal);
     } else {
       throw new ReconfigurationException(property, newVal, getConf().get(
           property));
@@ -2224,9 +2359,17 @@ public class NameNode extends ReconfigurableBase implements
                 DFS_NAMENODE_REPLICATION_WORK_MULTIPLIER_PER_ITERATION_DEFAULT,
                 newVal));
         newSetting = bm.getBlocksReplWorkMultiplier();
+      } else if (
+          property.equals(
+              DFS_NAMENODE_RECONSTRUCTION_PENDING_TIMEOUT_SEC_KEY)) {
+        bm.setReconstructionPendingTimeout(
+            adjustNewVal(
+                DFS_NAMENODE_RECONSTRUCTION_PENDING_TIMEOUT_SEC_DEFAULT,
+                newVal));
+        newSetting = bm.getReconstructionPendingTimeout();
       } else {
         throw new IllegalArgumentException("Unexpected property " +
-            property + "in reconfReplicationParameters");
+            property + " in reconfReplicationParameters");
       }
       LOG.info("RECONFIGURE* changed {} to {}", property, newSetting);
       return String.valueOf(newSetting);
@@ -2234,7 +2377,7 @@ public class NameNode extends ReconfigurableBase implements
       throw new ReconfigurationException(property, newVal, getConf().get(
           property), e);
     } finally {
-      namesystem.writeUnlock();
+      namesystem.writeUnlock("reconfReplicationParameters");
     }
   }
 
@@ -2271,7 +2414,7 @@ public class NameNode extends ReconfigurableBase implements
       throw new ReconfigurationException(property, newVal, getConf().get(
           property), nfe);
     } finally {
-      namesystem.writeUnlock();
+      namesystem.writeUnlock("reconfHeartbeatInterval");
       LOG.info("RECONFIGURE* changed heartbeatInterval to "
           + datanodeManager.getHeartbeatInterval());
     }
@@ -2295,7 +2438,7 @@ public class NameNode extends ReconfigurableBase implements
       throw new ReconfigurationException(property, newVal, getConf().get(
           property), nfe);
     } finally {
-      namesystem.writeUnlock();
+      namesystem.writeUnlock("reconfHeartbeatRecheckInterval");
       LOG.info("RECONFIGURE* changed heartbeatRecheckInterval to "
           + datanodeManager.getHeartbeatRecheckInterval());
     }
@@ -2367,6 +2510,132 @@ public class NameNode extends ReconfigurableBase implements
       }
     }
     return newVal;
+  }
+
+  String reconfigureParallelLoad(String newVal) {
+    boolean enableParallelLoad;
+    if (newVal == null) {
+      enableParallelLoad = DFS_IMAGE_PARALLEL_LOAD_DEFAULT;
+    } else {
+      enableParallelLoad = Boolean.parseBoolean(newVal);
+    }
+    FSImageFormatProtobuf.refreshParallelSaveAndLoad(enableParallelLoad);
+    return Boolean.toString(enableParallelLoad);
+  }
+
+  String reconfigureSlowNodesParameters(final DatanodeManager datanodeManager,
+      final String property, final String newVal) throws ReconfigurationException {
+    BlockManager bm = namesystem.getBlockManager();
+    namesystem.writeLock();
+    String result;
+    try {
+      switch (property) {
+      case DFS_NAMENODE_AVOID_SLOW_DATANODE_FOR_READ_KEY: {
+        boolean enable = (newVal == null ?
+            DFS_NAMENODE_AVOID_SLOW_DATANODE_FOR_READ_DEFAULT :
+            Boolean.parseBoolean(newVal));
+        result = Boolean.toString(enable);
+        datanodeManager.setAvoidSlowDataNodesForReadEnabled(enable);
+        break;
+      }
+      case DFS_NAMENODE_BLOCKPLACEMENTPOLICY_EXCLUDE_SLOW_NODES_ENABLED_KEY: {
+        boolean enable = (newVal == null ?
+            DFS_NAMENODE_BLOCKPLACEMENTPOLICY_EXCLUDE_SLOW_NODES_ENABLED_DEFAULT :
+            Boolean.parseBoolean(newVal));
+        result = Boolean.toString(enable);
+        bm.setExcludeSlowNodesEnabled(enable);
+        break;
+      }
+      case DFS_NAMENODE_MAX_SLOWPEER_COLLECT_NODES_KEY: {
+        int maxSlowpeerCollectNodes = (newVal == null ?
+            DFS_NAMENODE_MAX_SLOWPEER_COLLECT_NODES_DEFAULT :
+            Integer.parseInt(newVal));
+        result = Integer.toString(maxSlowpeerCollectNodes);
+        datanodeManager.setMaxSlowpeerCollectNodes(maxSlowpeerCollectNodes);
+        break;
+      }
+      case DFS_DATANODE_PEER_STATS_ENABLED_KEY: {
+        Timer timer = new Timer();
+        if (newVal != null && !newVal.equalsIgnoreCase("true") && !newVal.equalsIgnoreCase(
+            "false")) {
+          throw new IllegalArgumentException(newVal + " is not boolean value");
+        }
+        final boolean peerStatsEnabled = newVal == null ?
+            DFS_DATANODE_PEER_STATS_ENABLED_DEFAULT :
+            Boolean.parseBoolean(newVal);
+        result = Boolean.toString(peerStatsEnabled);
+        datanodeManager.initSlowPeerTracker(getConf(), timer, peerStatsEnabled);
+        break;
+      }
+      case DFS_DATANODE_MAX_NODES_TO_REPORT_KEY: {
+        int maxSlowPeersToReport = (newVal == null
+            ? DFS_DATANODE_MAX_NODES_TO_REPORT_DEFAULT : Integer.parseInt(newVal));
+        result = Integer.toString(maxSlowPeersToReport);
+        datanodeManager.setMaxSlowPeersToReport(maxSlowPeersToReport);
+        break;
+      }
+      default: {
+        throw new IllegalArgumentException(
+            "Unexpected property " + property + " in reconfigureSlowNodesParameters");
+      }
+      }
+      LOG.info("RECONFIGURE* changed {} to {}", property, newVal);
+      return result;
+    } catch (IllegalArgumentException e) {
+      throw new ReconfigurationException(property, newVal, getConf().get(
+          property), e);
+    } finally {
+      namesystem.writeUnlock("reconfigureSlowNodesParameters");
+    }
+  }
+
+  private String reconfigureBlockInvalidateLimit(final DatanodeManager datanodeManager,
+      final String property, final String newVal) throws ReconfigurationException {
+    namesystem.writeLock();
+    try {
+      if (newVal == null) {
+        datanodeManager.setBlockInvalidateLimit(DFSConfigKeys.DFS_BLOCK_INVALIDATE_LIMIT_DEFAULT);
+      } else {
+        datanodeManager.setBlockInvalidateLimit(Integer.parseInt(newVal));
+      }
+      final String updatedBlockInvalidateLimit =
+          String.valueOf(datanodeManager.getBlockInvalidateLimit());
+      LOG.info("RECONFIGURE* changed blockInvalidateLimit to {}", updatedBlockInvalidateLimit);
+      return updatedBlockInvalidateLimit;
+    } catch (NumberFormatException e) {
+      throw new ReconfigurationException(property, newVal, getConf().get(property), e);
+    } finally {
+      namesystem.writeUnlock("reconfigureBlockInvalidateLimit");
+    }
+  }
+
+  private String reconfigureDecommissionBackoffMonitorParameters(
+      final DatanodeManager datanodeManager, final String property, final String newVal)
+      throws ReconfigurationException {
+    String newSetting = null;
+    try {
+      if (property.equals(DFS_NAMENODE_DECOMMISSION_BACKOFF_MONITOR_PENDING_LIMIT)) {
+        int pendingRepLimit = (newVal == null ?
+            DFS_NAMENODE_DECOMMISSION_BACKOFF_MONITOR_PENDING_LIMIT_DEFAULT :
+            Integer.parseInt(newVal));
+        datanodeManager.getDatanodeAdminManager().refreshPendingRepLimit(pendingRepLimit,
+            DFS_NAMENODE_DECOMMISSION_BACKOFF_MONITOR_PENDING_LIMIT);
+        newSetting = String.valueOf(datanodeManager.getDatanodeAdminManager().getPendingRepLimit());
+      } else if (property.equals(
+          DFS_NAMENODE_DECOMMISSION_BACKOFF_MONITOR_PENDING_BLOCKS_PER_LOCK)) {
+        int blocksPerLock = (newVal == null ?
+            DFS_NAMENODE_DECOMMISSION_BACKOFF_MONITOR_PENDING_BLOCKS_PER_LOCK_DEFAULT :
+            Integer.parseInt(newVal));
+        datanodeManager.getDatanodeAdminManager().refreshBlocksPerLock(blocksPerLock,
+            DFS_NAMENODE_DECOMMISSION_BACKOFF_MONITOR_PENDING_BLOCKS_PER_LOCK);
+        newSetting = String.valueOf(datanodeManager.getDatanodeAdminManager().getBlocksPerLock());
+      }
+      LOG.info("RECONFIGURE* changed reconfigureDecommissionBackoffMonitorParameters {} to {}",
+          property, newSetting);
+      return newSetting;
+    } catch (IllegalArgumentException e) {
+      throw new ReconfigurationException(property, newVal, getConf().get(property), e);
+    }
   }
 
   @Override  // ReconfigurableBase

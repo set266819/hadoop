@@ -23,13 +23,18 @@ import org.apache.hadoop.hdfs.HdfsConfiguration;
 import org.apache.hadoop.hdfs.server.federation.router.FederationUtil;
 import org.apache.hadoop.hdfs.server.federation.router.RBFConfigKeys;
 import org.apache.hadoop.test.GenericTestUtils;
+import org.apache.hadoop.util.Time;
 import org.junit.Test;
 import org.slf4j.LoggerFactory;
 
+import java.util.concurrent.TimeUnit;
+
 import static org.apache.hadoop.hdfs.server.federation.fairness.RouterRpcFairnessConstants.CONCURRENT_NS;
+import static org.apache.hadoop.hdfs.server.federation.router.RBFConfigKeys.DFS_ROUTER_FAIRNESS_ACQUIRE_TIMEOUT;
 import static org.apache.hadoop.hdfs.server.federation.router.RBFConfigKeys.DFS_ROUTER_HANDLER_COUNT_KEY;
 import static org.apache.hadoop.hdfs.server.federation.router.RBFConfigKeys.DFS_ROUTER_MONITOR_NAMENODE;
 import static org.apache.hadoop.hdfs.server.federation.router.RBFConfigKeys.DFS_ROUTER_FAIR_HANDLER_COUNT_KEY_PREFIX;
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
@@ -83,32 +88,97 @@ public class TestRouterRpcFairnessPolicyController {
   }
 
   @Test
+  public void testAcquireTimeout() {
+    Configuration conf = createConf(40);
+    conf.setInt(DFS_ROUTER_FAIR_HANDLER_COUNT_KEY_PREFIX + "ns1", 30);
+    conf.setTimeDuration(DFS_ROUTER_FAIRNESS_ACQUIRE_TIMEOUT, 100, TimeUnit.MILLISECONDS);
+    RouterRpcFairnessPolicyController routerRpcFairnessPolicyController =
+        FederationUtil.newFairnessPolicyController(conf);
+
+    // ns1 should have 30 permits allocated
+    for (int i = 0; i < 30; i++) {
+      assertTrue(routerRpcFairnessPolicyController.acquirePermit("ns1"));
+    }
+    long acquireBeginTimeMs = Time.monotonicNow();
+    assertFalse(routerRpcFairnessPolicyController.acquirePermit("ns1"));
+    long acquireTimeMs = Time.monotonicNow() - acquireBeginTimeMs;
+
+    // There are some other operations, so acquireTimeMs >= 100ms.
+    assertTrue(acquireTimeMs >= 100);
+  }
+
+  @Test
   public void testAllocationErrorWithZeroHandlers() {
     Configuration conf = createConf(0);
-    verifyInstantiationError(conf);
+    verifyInstantiationError(conf, 0, 3);
   }
 
   @Test
   public void testAllocationErrorForLowDefaultHandlers() {
     Configuration conf = createConf(1);
-    verifyInstantiationError(conf);
+    verifyInstantiationError(conf, 1, 3);
   }
 
   @Test
   public void testAllocationErrorForLowDefaultHandlersPerNS() {
     Configuration conf = createConf(1);
     conf.setInt(DFS_ROUTER_FAIR_HANDLER_COUNT_KEY_PREFIX + "concurrent", 1);
-    verifyInstantiationError(conf);
+    verifyInstantiationError(conf, 1, 3);
+  }
+
+  @Test
+  public void testGetAvailableHandlerOnPerNs() {
+    RouterRpcFairnessPolicyController routerRpcFairnessPolicyController
+        = getFairnessPolicyController(30);
+    assertEquals("{\"concurrent\":10,\"ns2\":10,\"ns1\":10}",
+        routerRpcFairnessPolicyController.getAvailableHandlerOnPerNs());
+    routerRpcFairnessPolicyController.acquirePermit("ns1");
+    assertEquals("{\"concurrent\":10,\"ns2\":10,\"ns1\":9}",
+        routerRpcFairnessPolicyController.getAvailableHandlerOnPerNs());
+  }
+
+  @Test
+  public void testGetAvailableHandlerOnPerNsForNoFairness() {
+    Configuration conf = new Configuration();
+    RouterRpcFairnessPolicyController routerRpcFairnessPolicyController =
+        FederationUtil.newFairnessPolicyController(conf);
+    assertEquals("N/A",
+        routerRpcFairnessPolicyController.getAvailableHandlerOnPerNs());
   }
 
   @Test
   public void testAllocationErrorForLowPreconfiguredHandlers() {
     Configuration conf = createConf(1);
     conf.setInt(DFS_ROUTER_FAIR_HANDLER_COUNT_KEY_PREFIX + "ns1", 2);
-    verifyInstantiationError(conf);
+    verifyInstantiationError(conf, 1, 4);
   }
 
-  private void verifyInstantiationError(Configuration conf) {
+  @Test
+  public void testHandlerAllocationConcurrentConfigured() {
+    Configuration conf = createConf(5);
+    conf.setInt(DFS_ROUTER_FAIR_HANDLER_COUNT_KEY_PREFIX + "ns1", 1);
+    conf.setInt(DFS_ROUTER_FAIR_HANDLER_COUNT_KEY_PREFIX + "ns2", 1);
+    conf.setInt(DFS_ROUTER_FAIR_HANDLER_COUNT_KEY_PREFIX + "concurrent", 1);
+    RouterRpcFairnessPolicyController routerRpcFairnessPolicyController =
+        FederationUtil.newFairnessPolicyController(conf);
+
+    // ns1, ns2 should have 1 permit each
+    assertTrue(routerRpcFairnessPolicyController.acquirePermit("ns1"));
+    assertTrue(routerRpcFairnessPolicyController.acquirePermit("ns2"));
+    assertFalse(routerRpcFairnessPolicyController.acquirePermit("ns1"));
+    assertFalse(routerRpcFairnessPolicyController.acquirePermit("ns2"));
+
+    // concurrent should have 3 permits
+    for (int i=0; i<3; i++) {
+      assertTrue(
+          routerRpcFairnessPolicyController.acquirePermit(CONCURRENT_NS));
+    }
+    assertFalse(routerRpcFairnessPolicyController.acquirePermit(CONCURRENT_NS));
+  }
+
+
+  private void verifyInstantiationError(Configuration conf, int handlerCount,
+      int totalDedicatedHandlers) {
     GenericTestUtils.LogCapturer logs = GenericTestUtils.LogCapturer
         .captureLogs(LoggerFactory.getLogger(
             StaticRouterRpcFairnessPolicyController.class));
@@ -117,8 +187,11 @@ public class TestRouterRpcFairnessPolicyController {
     } catch (IllegalArgumentException e) {
       // Ignore the exception as it is expected here.
     }
-    assertTrue("Should contain error message",
-        logs.getOutput().contains("lower than min"));
+    String errorMsg = String.format(
+        StaticRouterRpcFairnessPolicyController.ERROR_MSG, handlerCount,
+        totalDedicatedHandlers);
+    assertTrue("Should contain error message: " + errorMsg,
+        logs.getOutput().contains(errorMsg));
   }
 
   private RouterRpcFairnessPolicyController getFairnessPolicyController(

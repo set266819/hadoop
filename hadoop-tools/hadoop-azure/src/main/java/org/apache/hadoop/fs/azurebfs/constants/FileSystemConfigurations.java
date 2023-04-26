@@ -32,7 +32,7 @@ import static org.apache.hadoop.fs.azurebfs.constants.AbfsHttpConstants.EMPTY_ST
 public final class FileSystemConfigurations {
 
   public static final String DEFAULT_FS_AZURE_ACCOUNT_IS_HNS_ENABLED = "";
-
+  public static final boolean DEFAULT_FS_AZURE_ACCOUNT_IS_EXPECT_HEADER_ENABLED = true;
   public static final String USER_HOME_DIRECTORY_PREFIX = "/user";
 
   private static final int SIXTY_SECONDS = 60 * 1000;
@@ -62,11 +62,14 @@ public final class FileSystemConfigurations {
   public static final boolean DEFAULT_OPTIMIZE_FOOTER_READ = false;
   public static final boolean DEFAULT_ALWAYS_READ_BUFFER_SIZE = false;
   public static final int DEFAULT_READ_AHEAD_BLOCK_SIZE = 4 * ONE_MB;
+  public static final int DEFAULT_READ_AHEAD_RANGE = 64 * ONE_KB; // 64 KB
   public static final int MIN_BUFFER_SIZE = 16 * ONE_KB;  // 16 KB
   public static final int MAX_BUFFER_SIZE = 100 * ONE_MB;  // 100 MB
   public static final long MAX_AZURE_BLOCK_SIZE = 256 * 1024 * 1024L; // changing default abfs blocksize to 256MB
   public static final String AZURE_BLOCK_LOCATION_HOST_DEFAULT = "localhost";
   public static final int DEFAULT_AZURE_LIST_MAX_RESULTS = 5000;
+
+  public static final String SERVER_SIDE_ENCRYPTION_ALGORITHM = "AES256";
 
   public static final int MAX_CONCURRENT_READ_THREADS = 12;
   public static final int MAX_CONCURRENT_WRITE_THREADS = 8;
@@ -76,13 +79,24 @@ public final class FileSystemConfigurations {
 
   public static final String DEFAULT_FS_AZURE_ATOMIC_RENAME_DIRECTORIES = "/hbase";
   public static final boolean DEFAULT_FS_AZURE_ENABLE_CONDITIONAL_CREATE_OVERWRITE = true;
+  public static final boolean DEFAULT_FS_AZURE_ENABLE_MKDIR_OVERWRITE = true;
   public static final String DEFAULT_FS_AZURE_APPEND_BLOB_DIRECTORIES = "";
+  public static final String DEFAULT_FS_AZURE_INFINITE_LEASE_DIRECTORIES = "";
+  public static final int DEFAULT_LEASE_THREADS = 0;
+  public static final int MIN_LEASE_THREADS = 0;
+  public static final int DEFAULT_LEASE_DURATION = -1;
+  public static final int INFINITE_LEASE_DURATION = -1;
+  public static final int MIN_LEASE_DURATION = 15;
+  public static final int MAX_LEASE_DURATION = 60;
 
-  public static final int DEFAULT_READ_AHEAD_QUEUE_DEPTH = -1;
+  public static final int DEFAULT_READ_AHEAD_QUEUE_DEPTH = 2;
 
   public static final boolean DEFAULT_ENABLE_FLUSH = true;
   public static final boolean DEFAULT_DISABLE_OUTPUTSTREAM_FLUSH = true;
   public static final boolean DEFAULT_ENABLE_AUTOTHROTTLING = true;
+  public static final boolean DEFAULT_FS_AZURE_ACCOUNT_LEVEL_THROTTLING_ENABLED = true;
+  public static final int DEFAULT_ACCOUNT_OPERATION_IDLE_TIMEOUT_MS = 60_000;
+  public static final int DEFAULT_ANALYSIS_PERIOD_MS = 10_000;
 
   public static final DelegatingSSLSocketFactory.SSLChannelMode DEFAULT_FS_AZURE_SSL_CHANNEL_MODE
       = DelegatingSSLSocketFactory.SSLChannelMode.Default;
@@ -95,11 +109,39 @@ public final class FileSystemConfigurations {
   public static final boolean DEFAULT_ABFS_LATENCY_TRACK = false;
   public static final long DEFAULT_SAS_TOKEN_RENEW_PERIOD_FOR_STREAMS_IN_SECONDS = 120;
 
+  public static final boolean DEFAULT_ENABLE_READAHEAD = true;
   public static final String DEFAULT_FS_AZURE_USER_AGENT_PREFIX = EMPTY_STRING;
   public static final String DEFAULT_VALUE_UNKNOWN = "UNKNOWN";
 
   public static final boolean DEFAULT_DELETE_CONSIDERED_IDEMPOTENT = true;
   public static final int DEFAULT_CLOCK_SKEW_WITH_SERVER_IN_MS = 5 * 60 * 1000; // 5 mins
+
+  public static final int STREAM_ID_LEN = 12;
+  public static final boolean DEFAULT_ENABLE_ABFS_LIST_ITERATOR = true;
+  public static final boolean DEFAULT_ENABLE_ABFS_RENAME_RESILIENCE = true;
+
+  /**
+   * Limit of queued block upload operations before writes
+   * block for an OutputStream. Value: {@value}
+   */
+  public static final int BLOCK_UPLOAD_ACTIVE_BLOCKS_DEFAULT = 20;
+
+  /**
+   * Buffer blocks to disk.
+   * Capacity is limited to available disk space.
+   */
+  public static final String DATA_BLOCKS_BUFFER_DISK = "disk";
+
+  /**
+   * Default buffer option: {@value}.
+   */
+  public static final String DATA_BLOCKS_BUFFER_DEFAULT =
+      DATA_BLOCKS_BUFFER_DISK;
+
+  /**
+   * IO rate limit. Value: {@value}
+   */
+  public static final int RATE_LIMIT_DEFAULT = 10_000;
 
   private FileSystemConfigurations() {}
 }

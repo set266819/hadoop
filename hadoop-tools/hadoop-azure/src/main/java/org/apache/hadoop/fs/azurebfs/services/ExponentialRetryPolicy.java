@@ -21,7 +21,10 @@ package org.apache.hadoop.fs.azurebfs.services;
 import java.util.Random;
 import java.net.HttpURLConnection;
 
-import org.apache.hadoop.thirdparty.com.google.common.annotations.VisibleForTesting;
+import org.apache.hadoop.fs.azurebfs.AbfsConfiguration;
+import org.apache.hadoop.classification.VisibleForTesting;
+
+import static org.apache.hadoop.fs.azurebfs.constants.AbfsHttpConstants.HTTP_CONTINUE;
 
 /**
  * Retry policy used by AbfsClient.
@@ -92,6 +95,16 @@ public class ExponentialRetryPolicy {
   /**
    * Initializes a new instance of the {@link ExponentialRetryPolicy} class.
    *
+   * @param conf The {@link AbfsConfiguration} from which to retrieve retry configuration.
+   */
+  public ExponentialRetryPolicy(AbfsConfiguration conf) {
+    this(conf.getMaxIoRetries(), conf.getMinBackoffIntervalMilliseconds(), conf.getMaxBackoffIntervalMilliseconds(),
+        conf.getBackoffIntervalMilliseconds());
+  }
+
+  /**
+   * Initializes a new instance of the {@link ExponentialRetryPolicy} class.
+   *
    * @param retryCount The maximum number of retry attempts.
    * @param minBackoff The minimum backoff time.
    * @param maxBackoff The maximum backoff time.
@@ -107,7 +120,9 @@ public class ExponentialRetryPolicy {
 
   /**
    * Returns if a request should be retried based on the retry count, current response,
-   * and the current strategy.
+   * and the current strategy. The valid http status code lies in the range of 1xx-5xx.
+   * But an invalid status code might be set due to network or timeout kind of issues.
+   * Such invalid status code also qualify for retry.
    *
    * @param retryCount The current retry attempt count.
    * @param statusCode The status code of the response, or -1 for socket error.
@@ -115,7 +130,7 @@ public class ExponentialRetryPolicy {
    */
   public boolean shouldRetry(final int retryCount, final int statusCode) {
     return retryCount < this.retryCount
-        && (statusCode == -1
+        && (statusCode < HTTP_CONTINUE
         || statusCode == HttpURLConnection.HTTP_CLIENT_TIMEOUT
         || (statusCode >= HttpURLConnection.HTTP_INTERNAL_ERROR
             && statusCode != HttpURLConnection.HTTP_NOT_IMPLEMENTED

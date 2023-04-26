@@ -26,6 +26,7 @@ import static org.apache.hadoop.hdfs.server.federation.FederationTestUtils.getFi
 import static org.apache.hadoop.hdfs.server.federation.FederationTestUtils.verifyFileExists;
 import static org.apache.hadoop.hdfs.server.federation.MiniRouterDFSCluster.TEST_STRING;
 import static org.apache.hadoop.test.GenericTestUtils.assertExceptionContains;
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -38,6 +39,7 @@ import static org.junit.Assert.fail;
 import java.io.IOException;
 import java.lang.reflect.Method;
 import java.net.URISyntaxException;
+import java.security.PrivilegedExceptionAction;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
@@ -55,7 +57,9 @@ import java.util.concurrent.TimeUnit;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.crypto.CryptoProtocolVersion;
+import org.apache.hadoop.fs.ContentSummary;
 import org.apache.hadoop.fs.CreateFlag;
+import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.FileContext;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
@@ -99,11 +103,13 @@ import org.apache.hadoop.hdfs.protocol.HdfsConstants.SafeModeAction;
 import org.apache.hadoop.hdfs.security.token.block.ExportedBlockKeys;
 import org.apache.hadoop.hdfs.server.blockmanagement.BlockManager;
 import org.apache.hadoop.hdfs.server.blockmanagement.BlockManagerTestUtil;
+import org.apache.hadoop.hdfs.server.datanode.DataNode;
 import org.apache.hadoop.hdfs.server.federation.MiniRouterDFSCluster;
 import org.apache.hadoop.hdfs.server.federation.MiniRouterDFSCluster.NamenodeContext;
 import org.apache.hadoop.hdfs.server.federation.MiniRouterDFSCluster.RouterContext;
 import org.apache.hadoop.hdfs.server.federation.MockResolver;
 import org.apache.hadoop.hdfs.server.federation.RouterConfigBuilder;
+import org.apache.hadoop.hdfs.server.federation.metrics.FederationRPCMetrics;
 import org.apache.hadoop.hdfs.server.federation.metrics.NamenodeBeanMetrics;
 import org.apache.hadoop.hdfs.server.federation.metrics.RBFMetrics;
 import org.apache.hadoop.hdfs.server.federation.resolver.FileSubclusterResolver;
@@ -126,6 +132,7 @@ import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.service.Service.STATE;
 import org.apache.hadoop.test.GenericTestUtils;
 import org.apache.hadoop.test.LambdaTestUtils;
+import org.codehaus.jettison.json.JSONException;
 import org.codehaus.jettison.json.JSONObject;
 import org.junit.AfterClass;
 import org.junit.Before;
@@ -184,6 +191,7 @@ public class TestRouterRpc {
   private NamenodeProtocol routerNamenodeProtocol;
   /** NameNodeProtocol interface to the Namenode. */
   private NamenodeProtocol nnNamenodeProtocol;
+  private NamenodeProtocol nnNamenodeProtocol1;
 
   /** Filesystem interface to the Router. */
   private FileSystem routerFS;
@@ -211,6 +219,14 @@ public class TestRouterRpc {
     cluster.setIndependentDNs();
 
     Configuration conf = new Configuration();
+    // Setup proxy users.
+    conf.set("hadoop.proxyuser.testRealUser.groups", "*");
+    conf.set("hadoop.proxyuser.testRealUser.hosts", "*");
+    String loginUser = UserGroupInformation.getLoginUser().getUserName();
+    conf.set(String.format("hadoop.proxyuser.%s.groups", loginUser), "*");
+    conf.set(String.format("hadoop.proxyuser.%s.hosts", loginUser), "*");
+    // Enable IP proxy users.
+    conf.set(DFSConfigKeys.DFS_NAMENODE_IP_PROXY_USERS, "placeholder");
     conf.setInt(DFSConfigKeys.DFS_LIST_LIMIT, 5);
     cluster.addNamenodeOverrides(conf);
     // Start NNs and DNs and wait until ready
@@ -365,6 +381,11 @@ public class TestRouterRpc {
     NamenodeContext nn0 = cluster.getNamenode(ns0, null);
     this.nnNamenodeProtocol = NameNodeProxies.createProxy(nn0.getConf(),
         nn0.getFileSystem().getUri(), NamenodeProtocol.class).getProxy();
+    // Namenode from the other namespace
+    String ns1 = cluster.getNameservices().get(1);
+    NamenodeContext nn1 = cluster.getNamenode(ns1, null);
+    this.nnNamenodeProtocol1 = NameNodeProxies.createProxy(nn1.getConf(),
+        nn1.getFileSystem().getUri(), NamenodeProtocol.class).getProxy();
   }
 
   protected String getNs() {
@@ -696,6 +717,7 @@ public class TestRouterRpc {
 
     DatanodeInfo[] combinedData =
         routerProtocol.getDatanodeReport(DatanodeReportType.ALL);
+    assertEquals(0, routerProtocol.getSlowDatanodeReport().length);
     final Map<Integer, String> routerDNMap = new TreeMap<>();
     for (DatanodeInfo dn : combinedData) {
       String subcluster = dn.getNetworkLocation().split("/")[1];
@@ -1233,7 +1255,7 @@ public class TestRouterRpc {
         newRouterFile, clientName, null, null,
         status.getFileId(), null, null);
 
-    DatanodeInfo[] exclusions = new DatanodeInfo[0];
+    DatanodeInfo[] exclusions = DatanodeInfo.EMPTY_ARRAY;
     LocatedBlock newBlock = routerProtocol.getAdditionalDatanode(
         newRouterFile, status.getFileId(), block.getBlock(),
         block.getLocations(), block.getStorageIDs(), exclusions, 1, clientName);
@@ -1301,11 +1323,14 @@ public class TestRouterRpc {
       // Check with default namespace specified.
       NamespaceInfo rVersion = routerNamenodeProtocol.versionRequest();
       NamespaceInfo nnVersion = nnNamenodeProtocol.versionRequest();
+      NamespaceInfo nnVersion1 = nnNamenodeProtocol1.versionRequest();
       compareVersion(rVersion, nnVersion);
       // Check with default namespace unspecified.
       resolver.setDisableNamespace(true);
-      rVersion = routerNamenodeProtocol.versionRequest();
-      compareVersion(rVersion, nnVersion);
+      // Verify the NamespaceInfo is of nn0 or nn1
+      boolean isNN0 =
+          rVersion.getBlockPoolID().equals(nnVersion.getBlockPoolID());
+      compareVersion(rVersion, isNN0 ? nnVersion : nnVersion1);
     } finally {
       resolver.setDisableNamespace(false);
     }
@@ -1374,11 +1399,13 @@ public class TestRouterRpc {
       // Check with default namespace specified.
       long routerTransactionID = routerNamenodeProtocol.getTransactionID();
       long nnTransactionID = nnNamenodeProtocol.getTransactionID();
+      long nnTransactionID1 = nnNamenodeProtocol1.getTransactionID();
       assertEquals(nnTransactionID, routerTransactionID);
       // Check with default namespace unspecified.
       resolver.setDisableNamespace(true);
+      // Verify the transaction ID is of nn0 or nn1
       routerTransactionID = routerNamenodeProtocol.getTransactionID();
-      assertEquals(nnTransactionID, routerTransactionID);
+      assertThat(routerTransactionID).isIn(nnTransactionID, nnTransactionID1);
     } finally {
       resolver.setDisableNamespace(false);
     }
@@ -1433,6 +1460,119 @@ public class TestRouterRpc {
     boolean routerSuccess = routerProtocol.restoreFailedStorage("check");
     boolean nnSuccess = nnProtocol.restoreFailedStorage("check");
     assertEquals(nnSuccess, routerSuccess);
+  }
+
+  private void testRenewLeaseInternal(DistributedFileSystem dfs,
+      FederationRPCMetrics rpcMetrics, Path testPath, boolean createFlag)
+      throws Exception {
+    FSDataOutputStream outputStream = null;
+    try {
+      if (createFlag) {
+        outputStream = dfs.create(testPath);
+      } else {
+        outputStream = dfs.append(testPath);
+      }
+      outputStream.write("hello world. \n".getBytes());
+      long proxyOpBeforeRenewLease = rpcMetrics.getProxyOps();
+      assertTrue(dfs.getClient().renewLease());
+      long proxyOpAfterRenewLease = rpcMetrics.getProxyOps();
+      assertEquals((proxyOpBeforeRenewLease + 1), proxyOpAfterRenewLease);
+    } finally {
+      if (outputStream != null) {
+        outputStream.close();
+      }
+    }
+  }
+
+  @Test
+  public void testRenewLeaseForECFile() throws Exception {
+    String ecName = "RS-6-3-1024k";
+    FederationRPCMetrics metrics = router.getRouterRpcServer().getRPCMetrics();
+    // Install a mount point to a different path to check
+    MockResolver resolver =
+        (MockResolver)router.getRouter().getSubclusterResolver();
+    String ns0 = cluster.getNameservices().get(0);
+    resolver.addLocation("/testRenewLease0", ns0, "/testRenewLease0");
+
+    // Stop LeaseRenewer
+    DistributedFileSystem routerDFS = (DistributedFileSystem) routerFS;
+    routerDFS.getClient().getLeaseRenewer().interruptAndJoin();
+
+    Path testECPath = new Path("/testRenewLease0/ecDirectory/test_ec.txt");
+    routerDFS.mkdirs(testECPath.getParent());
+    routerDFS.setErasureCodingPolicy(
+        testECPath.getParent(), ecName);
+    testRenewLeaseInternal(routerDFS, metrics, testECPath, true);
+
+    ErasureCodingPolicy ecPolicy = routerDFS.getErasureCodingPolicy(testECPath);
+    assertNotNull(ecPolicy);
+    assertEquals(ecName, ecPolicy.getName());
+  }
+
+
+  @Test
+  public void testRenewLeaseForReplicaFile() throws Exception {
+    FederationRPCMetrics metrics = router.getRouterRpcServer().getRPCMetrics();
+    // Install a mount point to a different path to check
+    MockResolver resolver =
+        (MockResolver)router.getRouter().getSubclusterResolver();
+    String ns0 = cluster.getNameservices().get(0);
+    resolver.addLocation("/testRenewLease0", ns0, "/testRenewLease0");
+
+    // Stop LeaseRenewer
+    DistributedFileSystem routerDFS = (DistributedFileSystem) routerFS;
+    routerDFS.getClient().getLeaseRenewer().interruptAndJoin();
+
+    // Test Replica File
+    Path testPath = new Path("/testRenewLease0/test_replica.txt");
+    testRenewLeaseInternal(routerDFS, metrics, testPath, true);
+    testRenewLeaseInternal(routerDFS, metrics, testPath, false);
+  }
+
+  @Test
+  public void testRenewLeaseWithMultiStream() throws Exception {
+    FederationRPCMetrics metrics = router.getRouterRpcServer().getRPCMetrics();
+    // Install a mount point to a different path to check
+    MockResolver resolver =
+        (MockResolver)router.getRouter().getSubclusterResolver();
+    String ns0 = cluster.getNameservices().get(0);
+    String ns1 = cluster.getNameservices().get(1);
+    resolver.addLocation("/testRenewLease0", ns0, "/testRenewLease0");
+    resolver.addLocation("/testRenewLease1", ns1, "/testRenewLease1");
+
+    // Stop LeaseRenewer
+    DistributedFileSystem routerDFS = (DistributedFileSystem) routerFS;
+    routerDFS.getClient().getLeaseRenewer().interruptAndJoin();
+
+    Path newTestPath0 = new Path("/testRenewLease0/test1.txt");
+    Path newTestPath1 = new Path("/testRenewLease1/test1.txt");
+    try (FSDataOutputStream outStream1 = routerDFS.create(newTestPath0);
+         FSDataOutputStream outStream2 = routerDFS.create(newTestPath1)) {
+      outStream1.write("hello world \n".getBytes());
+      outStream2.write("hello world \n".getBytes());
+      long proxyOpBeforeRenewLease2 = metrics.getProxyOps();
+      assertTrue(routerDFS.getClient().renewLease());
+      long proxyOpAfterRenewLease2 = metrics.getProxyOps();
+      assertEquals((proxyOpBeforeRenewLease2 + 2), proxyOpAfterRenewLease2);
+    }
+  }
+
+  @Test
+  public void testMkdirWithDisableNameService() throws Exception {
+    MockResolver resolver = (MockResolver)router.getRouter().getSubclusterResolver();
+    String ns0 = cluster.getNameservices().get(0);
+    resolver.addLocation("/mnt", ns0, "/");
+    MockResolver activeNamenodeResolver = (MockResolver)router.getRouter().getNamenodeResolver();
+    activeNamenodeResolver.disableNamespace(ns0);
+
+    try {
+      FsPermission permission = new FsPermission("777");
+      RouterRpcServer rpcServer = router.getRouter().getRpcServer();
+      LambdaTestUtils.intercept(NoLocationException.class,
+          () -> rpcServer.mkdirs("/mnt/folder0/folder1", permission, true));
+    } finally {
+      activeNamenodeResolver.clearDisableNamespaces();
+    }
   }
 
   @Test
@@ -1748,6 +1888,14 @@ public class TestRouterRpc {
   }
 
   @Test
+  public void testNamenodeMetricsEnteringMaintenanceNodes() throws IOException {
+    final NamenodeBeanMetrics metrics =
+            router.getRouter().getNamenodeMetrics();
+
+    assertEquals("{}", metrics.getEnteringMaintenanceNodes());
+  }
+
+  @Test
   public void testCacheAdmin() throws Exception {
     DistributedFileSystem routerDFS = (DistributedFileSystem) routerFS;
     // Verify cache directive commands.
@@ -1915,7 +2063,7 @@ public class TestRouterRpc {
   @Test
   public void testMkdirsWithCallerContext() throws IOException {
     GenericTestUtils.LogCapturer auditlog =
-        GenericTestUtils.LogCapturer.captureLogs(FSNamesystem.auditLog);
+        GenericTestUtils.LogCapturer.captureLogs(FSNamesystem.AUDIT_LOG);
 
     // Current callerContext is null
     assertNull(CallerContext.getCurrent());
@@ -1929,9 +2077,198 @@ public class TestRouterRpc {
     FsPermission permission = new FsPermission("755");
     routerProtocol.mkdirs(dirPath, permission, false);
 
-    // The audit log should contains "callerContext=clientContext,clientIp:"
-    assertTrue(auditlog.getOutput()
-        .contains("callerContext=clientContext,clientIp:"));
+    // The audit log should contains "callerContext=clientIp:...,clientContext"
+    final String logOutput = auditlog.getOutput();
+    assertTrue(logOutput.contains("callerContext=clientIp:"));
+    assertTrue(logOutput.contains(",clientContext"));
+    assertTrue(logOutput.contains(",clientId"));
+    assertTrue(logOutput.contains(",clientCallId"));
     assertTrue(verifyFileExists(routerFS, dirPath));
+  }
+
+  @Test
+  public void testRealUserPropagationInCallerContext()
+      throws IOException, InterruptedException {
+    GenericTestUtils.LogCapturer auditlog =
+        GenericTestUtils.LogCapturer.captureLogs(FSNamesystem.AUDIT_LOG);
+
+    // Current callerContext is null
+    assertNull(CallerContext.getCurrent());
+
+    UserGroupInformation loginUser = UserGroupInformation.getLoginUser();
+    UserGroupInformation realUser = UserGroupInformation
+        .createUserForTesting("testRealUser", new String[]{"group"});
+    UserGroupInformation proxyUser = UserGroupInformation
+        .createProxyUser("testProxyUser", realUser);
+    FileSystem proxyFs = proxyUser.doAs(
+        (PrivilegedExceptionAction<FileSystem>) () -> router.getFileSystem());
+    proxyFs.listStatus(new Path("/"));
+
+
+    final String logOutput = auditlog.getOutput();
+    // Login user, which is used as the router's user, is different from the realUser.
+    assertNotEquals(loginUser.getUserName(), realUser.getUserName());
+    // Login user is used in the audit log's ugi field.
+    assertTrue("The login user is the proxyUser in the UGI field",
+         logOutput.contains(String.format("ugi=%s (auth:PROXY) via %s (auth:SIMPLE)",
+             proxyUser.getUserName(),
+             loginUser.getUserName())));
+    // Real user is added to the caller context.
+    assertTrue("The audit log should contain the real user.",
+        logOutput.contains(String.format("realUser:%s", realUser.getUserName())));
+  }
+
+  @Test
+  public void testSetBalancerBandwidth() throws Exception {
+    long defaultBandwidth =
+        DFSConfigKeys.DFS_DATANODE_BALANCE_BANDWIDTHPERSEC_DEFAULT;
+    long newBandwidth = defaultBandwidth * 2;
+    routerProtocol.setBalancerBandwidth(newBandwidth);
+    ArrayList<DataNode> datanodes = cluster.getCluster().getDataNodes();
+    GenericTestUtils.waitFor(() ->  {
+      return datanodes.get(0).getBalancerBandwidth() == newBandwidth;
+    }, 100, 60 * 1000);
+  }
+
+  @Test
+  public void testAddClientIpPortToCallerContext() throws IOException {
+    GenericTestUtils.LogCapturer auditLog =
+        GenericTestUtils.LogCapturer.captureLogs(FSNamesystem.AUDIT_LOG);
+
+    // 1. ClientIp and ClientPort are not set on the client.
+    // Set client context.
+    CallerContext.setCurrent(
+        new CallerContext.Builder("clientContext").build());
+
+    // Create a directory via the router.
+    String dirPath = "/test";
+    routerProtocol.mkdirs(dirPath, new FsPermission("755"), false);
+
+    // The audit log should contains "clientIp:" and "clientPort:".
+    assertTrue(auditLog.getOutput().contains("clientIp:"));
+    assertTrue(auditLog.getOutput().contains("clientPort:"));
+    assertTrue(verifyFileExists(routerFS, dirPath));
+    auditLog.clearOutput();
+
+    // 2. ClientIp and ClientPort are set on the client.
+    // Reset client context.
+    CallerContext.setCurrent(
+        new CallerContext.Builder(
+            "clientContext,clientIp:1.1.1.1,clientPort:1234").build());
+
+    // Create a directory via the router.
+    routerProtocol.getFileInfo(dirPath);
+
+    // The audit log should not contain the original clientIp and clientPort
+    // set by client.
+    assertFalse(auditLog.getOutput().contains("clientIp:1.1.1.1"));
+    assertFalse(auditLog.getOutput().contains("clientPort:1234"));
+  }
+
+  @Test
+  public void testAddClientIdAndCallIdToCallerContext() throws IOException {
+    GenericTestUtils.LogCapturer auditLog =
+        GenericTestUtils.LogCapturer.captureLogs(FSNamesystem.AUDIT_LOG);
+
+    // 1. ClientId and ClientCallId are not set on the client.
+    // Set client context.
+    CallerContext.setCurrent(
+        new CallerContext.Builder("clientContext").build());
+
+    // Create a directory via the router.
+    String dirPath = "/test";
+    routerProtocol.mkdirs(dirPath, new FsPermission("755"), false);
+
+    // The audit log should contains "clientId:" and "clientCallId:".
+    assertTrue(auditLog.getOutput().contains("clientId:"));
+    assertTrue(auditLog.getOutput().contains("clientCallId:"));
+    assertTrue(verifyFileExists(routerFS, dirPath));
+    auditLog.clearOutput();
+
+    // 2. ClientId and ClientCallId are set on the client.
+    // Reset client context.
+    CallerContext.setCurrent(
+        new CallerContext.Builder(
+            "clientContext,clientId:mockClientId,clientCallId:4321").build());
+
+    // Create a directory via the router.
+    routerProtocol.getFileInfo(dirPath);
+
+    // The audit log should not contain the original clientId and clientCallId
+    // set by client.
+    assertFalse(auditLog.getOutput().contains("clientId:mockClientId"));
+    assertFalse(auditLog.getOutput().contains("clientCallId:4321"));
+  }
+
+  @Test
+  public void testContentSummaryWithSnapshot() throws Exception {
+    DistributedFileSystem routerDFS = (DistributedFileSystem) routerFS;
+    Path dirPath = new Path("/testdir");
+    Path subdirPath = new Path(dirPath, "subdir");
+    Path filePath1 = new Path(dirPath, "file");
+    Path filePath2 = new Path(subdirPath, "file2");
+
+    // Create directories.
+    routerDFS.mkdirs(dirPath);
+    routerDFS.mkdirs(subdirPath);
+
+    // Create files.
+    createFile(routerDFS, filePath1.toString(), 32);
+    createFile(routerDFS, filePath2.toString(), 16);
+
+    // Allow & Create snapshot.
+    routerDFS.allowSnapshot(dirPath);
+    routerDFS.createSnapshot(dirPath, "s1");
+
+    try {
+      // Check content summary, snapshot count should be 0
+      ContentSummary contentSummary = routerDFS.getContentSummary(dirPath);
+      assertEquals(0, contentSummary.getSnapshotDirectoryCount());
+      assertEquals(0, contentSummary.getSnapshotFileCount());
+
+      // Delete the file & subdir(Total 2 files deleted & 1 directory)
+      routerDFS.delete(filePath1, true);
+      routerDFS.delete(subdirPath, true);
+
+      // Get the Content Summary
+      contentSummary = routerDFS.getContentSummary(dirPath);
+      assertEquals(1, contentSummary.getSnapshotDirectoryCount());
+      assertEquals(2, contentSummary.getSnapshotFileCount());
+    } finally {
+      // Cleanup
+      routerDFS.deleteSnapshot(dirPath, "s1");
+      routerDFS.disallowSnapshot(dirPath);
+      routerDFS.delete(dirPath, true);
+    }
+  }
+
+  @Test
+  public void testDisableNodeUsageInRBFMetrics() throws JSONException {
+    RBFMetrics rbfMetrics = router.getRouter().getMetrics();
+    FederationRPCMetrics federationRPCMetrics = router.getRouter().getRpcServer().getRPCMetrics();
+
+    long proxyOpBefore = federationRPCMetrics.getProxyOps();
+    String nodeUsageEnable = router.getRouter().getMetrics().getNodeUsage();
+    assertNotNull(nodeUsageEnable);
+    long proxyOpAfterWithEnable = federationRPCMetrics.getProxyOps();
+    assertEquals(proxyOpBefore + 2, proxyOpAfterWithEnable);
+
+    rbfMetrics.setEnableGetDNUsage(false);
+    String nodeUsageDisable = rbfMetrics.getNodeUsage();
+    assertNotNull(nodeUsageDisable);
+    long proxyOpAfterWithDisable = federationRPCMetrics.getProxyOps();
+    assertEquals(proxyOpAfterWithEnable, proxyOpAfterWithDisable);
+    JSONObject jsonObject = new JSONObject(nodeUsageDisable);
+    JSONObject json = jsonObject.getJSONObject("nodeUsage");
+    assertEquals("0.00%", json.get("min"));
+    assertEquals("0.00%", json.get("median"));
+    assertEquals("0.00%", json.get("max"));
+    assertEquals("0.00%", json.get("stdDev"));
+
+    rbfMetrics.setEnableGetDNUsage(true);
+    String nodeUsageWithReEnable = rbfMetrics.getNodeUsage();
+    assertNotNull(nodeUsageWithReEnable);
+    long proxyOpAfterWithReEnable = federationRPCMetrics.getProxyOps();
+    assertEquals(proxyOpAfterWithDisable + 2, proxyOpAfterWithReEnable);
   }
 }

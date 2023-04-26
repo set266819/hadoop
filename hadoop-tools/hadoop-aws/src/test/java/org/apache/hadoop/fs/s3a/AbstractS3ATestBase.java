@@ -27,18 +27,22 @@ import org.apache.hadoop.fs.contract.ContractTestUtils;
 import org.apache.hadoop.fs.contract.s3a.S3AContract;
 import org.apache.hadoop.fs.s3a.tools.MarkerTool;
 import org.apache.hadoop.fs.statistics.IOStatisticsSnapshot;
+import org.apache.hadoop.fs.statistics.IOStatisticsContext;
+import org.apache.hadoop.fs.store.audit.AuditSpan;
+import org.apache.hadoop.fs.store.audit.AuditSpanSource;
 import org.apache.hadoop.io.IOUtils;
 
 import org.junit.AfterClass;
+import org.junit.Assume;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.FileNotFoundException;
 import java.io.IOException;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.apache.hadoop.fs.contract.ContractTestUtils.dataset;
 import static org.apache.hadoop.fs.contract.ContractTestUtils.writeDataset;
-import static org.apache.hadoop.fs.s3a.S3ATestUtils.getTestDynamoTablePrefix;
 import static org.apache.hadoop.fs.s3a.S3ATestUtils.getTestPropertyBool;
 import static org.apache.hadoop.fs.s3a.S3AUtils.E_FS_CLOSED;
 import static org.apache.hadoop.fs.s3a.tools.MarkerTool.UNLIMITED_LISTING;
@@ -59,6 +63,36 @@ public abstract class AbstractS3ATestBase extends AbstractFSContractTestBase
   protected static final IOStatisticsSnapshot FILESYSTEM_IOSTATS =
       snapshotIOStatistics();
 
+  /**
+   * Source of audit spans.
+   */
+  private AuditSpanSource spanSource;
+
+  /**
+   * Atomic references to be used to re-throw an Exception or an ASE
+   * caught inside a lambda function.
+   */
+  private static final AtomicReference<Exception> FUTURE_EXCEPTION =
+      new AtomicReference<>();
+  private static final AtomicReference<AssertionError> FUTURE_ASE =
+      new AtomicReference<>();
+
+  /**
+   * Get the source.
+   * @return span source
+   */
+  protected AuditSpanSource getSpanSource() {
+    return spanSource;
+  }
+
+  /**
+   * Set the span source.
+   * @param spanSource new value.
+   */
+  protected void setSpanSource(final AuditSpanSource spanSource) {
+    this.spanSource = spanSource;
+  }
+
   @Override
   protected AbstractFSContract createContract(Configuration conf) {
     return new S3AContract(conf, false);
@@ -75,6 +109,10 @@ public abstract class AbstractS3ATestBase extends AbstractFSContractTestBase
     // static initializers. See: HADOOP-17385
     S3AFileSystem.initializeClass();
     super.setup();
+    setSpanSource(getFileSystem());
+    // Reset the current context's thread IOStatistics.`
+    // this ensures that the context stats will always be from the test case
+    IOStatisticsContext.getCurrentIOStatisticsContext().reset();
   }
 
   @Override
@@ -150,7 +188,7 @@ public abstract class AbstractS3ATestBase extends AbstractFSContractTestBase
   }
 
   /**
-   * Create a configuration, possibly patching in S3Guard options.
+   * Create a configuration.
    * @return a configuration
    */
   @Override
@@ -210,7 +248,82 @@ public abstract class AbstractS3ATestBase extends AbstractFSContractTestBase
     ContractTestUtils.verifyFileContents(getFileSystem(), path, data);
   }
 
-  protected String getTestTableName(String suffix) {
-    return getTestDynamoTablePrefix(getConfiguration()) + suffix;
+  /**
+   * Create a span from the source; returns a no-op if
+   * creation fails or the source is null.
+   * Uses the test method name for the span.
+   * @return a span.
+   */
+  protected AuditSpan span() throws IOException {
+    return span(getSpanSource());
+  }
+
+  /**
+   * Create a span from the source; returns a no-op if
+   * creation fails or the source is null.
+   * Uses the test method name for the span.
+   * @param source source of spans; can be an S3A FS
+   * @return a span.
+   */
+  protected AuditSpan span(AuditSpanSource source) throws IOException {
+
+    return source.createSpan(getMethodName(), null, null);
+  }
+
+  /**
+   *  Method to assume that S3 client side encryption is disabled on a test.
+   */
+  public void skipIfClientSideEncryption() {
+    Assume.assumeTrue("Skipping test if CSE is enabled",
+        !getFileSystem().isCSEEnabled());
+  }
+
+  /**
+   * If an exception is caught while doing some work in a Lambda function,
+   * store it in an atomic reference to be thrown later on.
+   * @param exception Exception caught.
+   */
+  public static void setFutureException(Exception exception) {
+    FUTURE_EXCEPTION.set(exception);
+  }
+
+  /**
+   * If an Assertion is caught while doing some work in a Lambda function,
+   * store it in an atomic reference to be thrown later on.
+   *
+   * @param ase Assertion Error caught.
+   */
+  public static void setFutureAse(AssertionError ase) {
+    FUTURE_ASE.set(ase);
+  }
+
+  /**
+   * throw the caught exception from the atomic reference and also clear the
+   * atomic reference so that we don't rethrow in another test.
+   *
+   * @throws Exception the exception caught.
+   */
+  public static void maybeReThrowFutureException() throws Exception {
+    if (FUTURE_EXCEPTION.get() != null) {
+      Exception exceptionToThrow = FUTURE_EXCEPTION.get();
+      // reset the atomic ref before throwing.
+      setFutureAse(null);
+      throw exceptionToThrow;
+    }
+  }
+
+  /**
+   * throw the Assertion error from the atomic reference and also clear the
+   * atomic reference so that we don't rethrow in another test.
+   *
+   * @throws Exception Assertion error caught.
+   */
+  public static void maybeReThrowFutureASE() throws Exception {
+    if (FUTURE_ASE.get() != null) {
+      AssertionError aseToThrow = FUTURE_ASE.get();
+      // reset the atomic ref before throwing.
+      setFutureAse(null);
+      throw aseToThrow;
+    }
   }
 }

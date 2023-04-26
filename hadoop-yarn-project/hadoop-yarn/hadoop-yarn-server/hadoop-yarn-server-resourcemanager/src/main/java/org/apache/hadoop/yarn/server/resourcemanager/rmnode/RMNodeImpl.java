@@ -37,6 +37,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock.WriteLock;
 
 import org.apache.commons.collections.keyvalue.DefaultMapEntry;
 import org.apache.hadoop.yarn.server.api.records.NodeStatus;
+import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.apache.hadoop.classification.InterfaceAudience.Private;
@@ -93,7 +94,7 @@ import org.apache.hadoop.yarn.state.StateMachine;
 import org.apache.hadoop.yarn.state.StateMachineFactory;
 import org.apache.hadoop.yarn.util.resource.Resources;
 
-import org.apache.hadoop.thirdparty.com.google.common.annotations.VisibleForTesting;
+import org.apache.hadoop.classification.VisibleForTesting;
 
 /**
  * This class is used to keep track of all the applications/containers
@@ -127,6 +128,8 @@ public class RMNodeImpl implements RMNode, EventHandler<RMNodeEvent> {
   /* Snapshot of total resources before receiving decommissioning command */
   private volatile Resource originalTotalCapability;
   private volatile Resource totalCapability;
+  private volatile Resource allocatedContainerResource =
+      Resource.newInstance(Resources.none());
   private volatile boolean updatedCapability = false;
   private final Node node;
 
@@ -461,6 +464,11 @@ public class RMNodeImpl implements RMNode, EventHandler<RMNodeEvent> {
   @Override
   public Resource getTotalCapability() {
     return this.totalCapability;
+  }
+
+  @Override
+  public Resource getAllocatedContainerResource() {
+    return this.allocatedContainerResource;
   }
 
   @Override
@@ -951,13 +959,22 @@ public class RMNodeImpl implements RMNode, EventHandler<RMNodeEvent> {
           ClusterMetrics.getMetrics().decrDecommisionedNMs();
         }
         containers = startEvent.getNMContainerStatuses();
+        final Resource allocatedResource = Resource.newInstance(
+            Resources.none());
         if (containers != null && !containers.isEmpty()) {
           for (NMContainerStatus container : containers) {
-            if (container.getContainerState() == ContainerState.RUNNING) {
-              rmNode.launchedContainers.add(container.getContainerId());
+            if (container.getContainerState() == ContainerState.NEW ||
+                container.getContainerState() == ContainerState.RUNNING) {
+              Resources.addTo(allocatedResource,
+                  container.getAllocatedResource());
+              if (container.getContainerState() == ContainerState.RUNNING) {
+                rmNode.launchedContainers.add(container.getContainerId());
+              }
             }
           }
         }
+
+        rmNode.allocatedContainerResource = allocatedResource;
       }
 
       if (null != startEvent.getRunningApplications()) {
@@ -1186,8 +1203,8 @@ public class RMNodeImpl implements RMNode, EventHandler<RMNodeEvent> {
 
   /**
    * Put a node in deactivated (decommissioned or shutdown) status.
-   * @param rmNode
-   * @param finalState
+   * @param rmNode RMNode.
+   * @param finalState NodeState.
    */
   public static void deactivateNode(RMNodeImpl rmNode, NodeState finalState) {
 
@@ -1209,8 +1226,8 @@ public class RMNodeImpl implements RMNode, EventHandler<RMNodeEvent> {
 
   /**
    * Report node is RUNNING.
-   * @param rmNode
-   * @param containers
+   * @param rmNode RMNode.
+   * @param containers NMContainerStatus List.
    */
   public static void reportNodeRunning(RMNodeImpl rmNode,
       List<NMContainerStatus> containers) {
@@ -1225,8 +1242,8 @@ public class RMNodeImpl implements RMNode, EventHandler<RMNodeEvent> {
 
   /**
    * Report node is UNUSABLE and update metrics.
-   * @param rmNode
-   * @param finalState
+   * @param rmNode RMNode.
+   * @param finalState NodeState.
    */
   public static void reportNodeUnusable(RMNodeImpl rmNode,
       NodeState finalState) {
@@ -1354,8 +1371,23 @@ public class RMNodeImpl implements RMNode, EventHandler<RMNodeEvent> {
           initialState.equals(NodeState.DECOMMISSIONING);
       if (isNodeDecommissioning) {
         List<ApplicationId> keepAliveApps = statusEvent.getKeepAliveAppIds();
+        // hasScheduledAMContainers solves the following race condition -
+        // 1. launch AM container on a node with 0 containers.
+        // 2. gracefully decommission this node.
+        // 3. Node heartbeats to RM. In StatusUpdateWhenHealthyTransition,
+        //    rmNode.runningApplications will be empty as it is updated after
+        //    call to RMNodeImpl.deactivateNode. This will cause the node to be
+        //    deactivated even though container is running on it and hence kill
+        //    all containers running on it.
+        // In order to avoid such race conditions the ground truth is retrieved
+        // from the scheduler before deactivating a DECOMMISSIONING node.
+        // Only AM containers are considered as AM container reattempts can
+        // cause application failures if max attempts is set to 1.
         if (rmNode.runningApplications.isEmpty() &&
-            (keepAliveApps == null || keepAliveApps.isEmpty())) {
+            (keepAliveApps == null || keepAliveApps.isEmpty()) &&
+            !hasScheduledAMContainers(rmNode)) {
+          LOG.info("No containers running on " + rmNode.nodeId + ". "
+              + "Attempting to deactivate decommissioning node.");
           RMNodeImpl.deactivateNode(rmNode, NodeState.DECOMMISSIONED);
           return NodeState.DECOMMISSIONED;
         }
@@ -1400,6 +1432,17 @@ public class RMNodeImpl implements RMNode, EventHandler<RMNodeEvent> {
       }
 
       return initialState;
+    }
+
+    /**
+     * Checks if the scheduler has scheduled any AMs on the given node.
+     * @return true if node has any AM scheduled on it.
+     */
+    private boolean hasScheduledAMContainers(RMNodeImpl rmNode) {
+      return rmNode.context.getScheduler()
+          .getSchedulerNode(rmNode.getNodeID())
+          .getCopiedListOfRunningContainers()
+          .stream().anyMatch(RMContainer::isAMContainer);
     }
   }
 
@@ -1466,6 +1509,11 @@ public class RMNodeImpl implements RMNode, EventHandler<RMNodeEvent> {
 
   // For test only.
   @VisibleForTesting
+  public Map<ContainerId, ContainerStatus> getUpdatedExistContainers() {
+    return this.updatedExistContainers;
+  }
+  // For test only.
+  @VisibleForTesting
   public Set<ContainerId> getLaunchedContainers() {
     return this.launchedContainers;
   }
@@ -1522,6 +1570,8 @@ public class RMNodeImpl implements RMNode, EventHandler<RMNodeEvent> {
     List<Map.Entry<ApplicationId, ContainerStatus>> needUpdateContainers =
         new ArrayList<Map.Entry<ApplicationId, ContainerStatus>>();
     int numRemoteRunningContainers = 0;
+    final Resource allocatedResource = Resource.newInstance(Resources.none());
+
     for (ContainerStatus remoteContainer : containerStatuses) {
       ContainerId containerId = remoteContainer.getContainerId();
 
@@ -1582,6 +1632,7 @@ public class RMNodeImpl implements RMNode, EventHandler<RMNodeEvent> {
       } else {
         // A finished container
         launchedContainers.remove(containerId);
+        updatedExistContainers.remove(containerId);
         if (completedContainers.add(containerId)) {
           newlyCompletedContainers.add(remoteContainer);
         }
@@ -1589,12 +1640,21 @@ public class RMNodeImpl implements RMNode, EventHandler<RMNodeEvent> {
         containerAllocationExpirer
             .unregister(new AllocationExpirationInfo(containerId));
       }
+
+      if ((remoteContainer.getState() == ContainerState.RUNNING ||
+          remoteContainer.getState() == ContainerState.NEW) &&
+          remoteContainer.getCapability() != null) {
+        Resources.addTo(allocatedResource, remoteContainer.getCapability());
+      }
     }
+
+    allocatedContainerResource = allocatedResource;
 
     List<ContainerStatus> lostContainers =
         findLostContainers(numRemoteRunningContainers, containerStatuses);
     for (ContainerStatus remoteContainer : lostContainers) {
       ContainerId containerId = remoteContainer.getContainerId();
+      updatedExistContainers.remove(containerId);
       if (completedContainers.add(containerId)) {
         newlyCompletedContainers.add(remoteContainer);
       }

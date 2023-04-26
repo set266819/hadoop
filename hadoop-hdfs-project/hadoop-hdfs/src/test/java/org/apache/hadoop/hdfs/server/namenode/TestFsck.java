@@ -23,7 +23,6 @@ import static org.apache.hadoop.hdfs.MiniDFSCluster.HDFS_MINIDFS_BASEDIR;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 import static org.mockito.ArgumentMatchers.any;
@@ -31,12 +30,10 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
-import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
-import java.io.FileReader;
 import java.io.IOException;
 import java.io.PrintStream;
 import java.io.PrintWriter;
@@ -50,6 +47,7 @@ import java.security.PrivilegedExceptionAction;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
@@ -60,8 +58,6 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import java.util.function.Supplier;
-import org.apache.commons.logging.impl.Log4JLogger;
-import org.slf4j.LoggerFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.ChecksumException;
 import org.apache.hadoop.fs.FSDataOutputStream;
@@ -119,17 +115,15 @@ import org.apache.hadoop.net.NetworkTopology;
 import org.apache.hadoop.security.AccessControlException;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.test.GenericTestUtils;
+import org.apache.hadoop.test.GenericTestUtils.LogCapturer;
 import org.apache.hadoop.util.ToolRunner;
-import org.apache.log4j.Level;
-import org.apache.log4j.Logger;
-import org.apache.log4j.PatternLayout;
-import org.apache.log4j.RollingFileAppender;
 import org.junit.After;
+import org.junit.AfterClass;
 import org.junit.Assert;
 import org.junit.Before;
+import org.junit.BeforeClass;
 import org.junit.Test;
-
-import org.apache.hadoop.thirdparty.com.google.common.collect.Sets;
+import org.slf4j.LoggerFactory;
 
 /**
  * A JUnit test for doing fsck.
@@ -138,21 +132,18 @@ public class TestFsck {
   private static final org.slf4j.Logger LOG =
       LoggerFactory.getLogger(TestFsck.class.getName());
 
-  static final String AUDITLOG_FILE =
-      GenericTestUtils.getTempPath("TestFsck-audit.log");
-  
-  // Pattern for: 
+  // Pattern for:
   // allowed=true ugi=name ip=/address cmd=FSCK src=/ dst=null perm=null
   static final Pattern FSCK_PATTERN = Pattern.compile(
       "allowed=.*?\\s" +
-      "ugi=.*?\\s" + 
-      "ip=/\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\s" + 
+      "ugi=.*?\\s" +
+      "ip=/\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\s" +
       "cmd=fsck\\ssrc=\\/\\sdst=null\\s" + 
       "perm=null\\s" + "proto=.*");
   static final Pattern GET_FILE_INFO_PATTERN = Pattern.compile(
       "allowed=.*?\\s" +
-      "ugi=.*?\\s" + 
-      "ip=/\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\s" + 
+      "ugi=.*?\\s" +
+      "ip=/\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\s" +
       "cmd=getfileinfo\\ssrc=\\/\\sdst=null\\s" + 
       "perm=null\\s" + "proto=.*");
 
@@ -164,6 +155,8 @@ public class TestFsck {
   
   private static final String LINE_SEPARATOR =
       System.getProperty("line.separator");
+
+  private static LogCapturer auditLogCapture;
 
   public static String runFsck(Configuration conf, int expectedErrCode,
                         boolean checkErrorCode, String... path)
@@ -184,6 +177,16 @@ public class TestFsck {
 
   private MiniDFSCluster cluster = null;
   private Configuration conf = null;
+
+  @BeforeClass
+  public static void beforeClass() {
+    auditLogCapture = LogCapturer.captureLogs(FSNamesystem.AUDIT_LOG);
+  }
+
+  @AfterClass
+  public static void afterClass() {
+    auditLogCapture.stopCapturing();
+  }
 
   @Before
   public void setUp() throws Exception {
@@ -223,7 +226,6 @@ public class TestFsck {
     final Path file = new Path(fileName);
     long aTime = fs.getFileStatus(file).getAccessTime();
     Thread.sleep(precision);
-    setupAuditLogs();
     String outStr = runFsck(conf, 0, true, "/");
     verifyAuditLogs();
     assertEquals(aTime, fs.getFileStatus(file).getAccessTime());
@@ -247,54 +249,29 @@ public class TestFsck {
     util.cleanup(fs, "/srcdat");
   }
 
-  /** Sets up log4j logger for auditlogs. */
-  private void setupAuditLogs() throws IOException {
-    File file = new File(AUDITLOG_FILE);
-    if (file.exists()) {
-      file.delete();
+  private void verifyAuditLogs() {
+    String[] auditLogOutputLines = auditLogCapture.getOutput().split("\\n");
+    int fileStatusSuccess = 0;
+    int fsckCount = 0;
+    for (String auditLogLine : auditLogOutputLines) {
+      if (!auditLogLine.contains("allowed=")) {
+        continue;
+      }
+      String extractedAuditLog = "allowed=" + auditLogLine.split("allowed=")[1];
+      LOG.info("Line: {}", extractedAuditLog);
+      if (extractedAuditLog.contains("cmd=getfileinfo") && GET_FILE_INFO_PATTERN.matcher(
+          extractedAuditLog).matches()) {
+        fileStatusSuccess++;
+      } else if (FSCK_PATTERN.matcher(extractedAuditLog).matches()) {
+        fsckCount++;
+      }
     }
-    Logger logger = ((Log4JLogger) FSNamesystem.auditLog).getLogger();
-    logger.removeAllAppenders();
-    logger.setLevel(Level.INFO);
-    PatternLayout layout = new PatternLayout("%m%n");
-    RollingFileAppender appender =
-        new RollingFileAppender(layout, AUDITLOG_FILE);
-    logger.addAppender(appender);
-  }
-  
-  private void verifyAuditLogs() throws IOException {
-    // Turn off the logs
-    Logger logger = ((Log4JLogger) FSNamesystem.auditLog).getLogger();
-    logger.setLevel(Level.OFF);
-
-    BufferedReader reader = null;
-    try {
-      // Audit log should contain one getfileinfo and one fsck
-      reader = new BufferedReader(new FileReader(AUDITLOG_FILE));
-      String line;
-
-      // one extra getfileinfo stems from resolving the path
-      //
-      for (int i = 0; i < 2; i++) {
-        line = reader.readLine();
-        assertNotNull(line);
-        assertTrue("Expected getfileinfo event not found in audit log",
-            GET_FILE_INFO_PATTERN.matcher(line).matches());
-      }
-      line = reader.readLine();
-      assertNotNull(line);
-      assertTrue("Expected fsck event not found in audit log", FSCK_PATTERN
-          .matcher(line).matches());
-      assertNull("Unexpected event in audit log", reader.readLine());
-    } finally {
-      // Close the reader and remove the appender to release the audit log file
-      // handle after verifying the content of the file.
-      if (reader != null) {
-        reader.close();
-      }
-      if (logger != null) {
-        logger.removeAllAppenders();
-      }
+    if (fileStatusSuccess < 2) {
+      throw new AssertionError(
+          "getfileinfo cmd should occur at least 2 times. Actual count: " + fileStatusSuccess);
+    }
+    if (fsckCount < 1) {
+      throw new AssertionError("fsck should be present at least once. Actual count: " + fsckCount);
     }
   }
   
@@ -386,15 +363,15 @@ public class TestFsck {
                                         cluster.getNameNodePort()), conf);
     String[] fileNames = util.getFileNames(topDir);
     CorruptedTestFile[] ctFiles = new CorruptedTestFile[]{
-        new CorruptedTestFile(fileNames[0], Sets.newHashSet(0),
+        new CorruptedTestFile(fileNames[0], new HashSet<>(Arrays.asList(0)),
             dfsClient, numDatanodes, dfsBlockSize),
-        new CorruptedTestFile(fileNames[1], Sets.newHashSet(2, 3),
+        new CorruptedTestFile(fileNames[1], new HashSet<>(Arrays.asList(2, 3)),
             dfsClient, numDatanodes, dfsBlockSize),
-        new CorruptedTestFile(fileNames[2], Sets.newHashSet(4),
+        new CorruptedTestFile(fileNames[2], new HashSet<>(Arrays.asList(4)),
             dfsClient, numDatanodes, dfsBlockSize),
-        new CorruptedTestFile(fileNames[3], Sets.newHashSet(0, 1, 2, 3),
+        new CorruptedTestFile(fileNames[3], new HashSet<>(Arrays.asList(0, 1, 2, 3)),
             dfsClient, numDatanodes, dfsBlockSize),
-        new CorruptedTestFile(fileNames[4], Sets.newHashSet(1, 2, 3, 4),
+        new CorruptedTestFile(fileNames[4], new HashSet<>(Arrays.asList(1, 2, 3, 4)),
             dfsClient, numDatanodes, dfsBlockSize)
     };
     int totalMissingBlocks = 0;
@@ -567,7 +544,7 @@ public class TestFsck {
           }
         }
       } finally {
-        IOUtils.cleanup(null, in);
+        IOUtils.cleanupWithLogger(null, in);
       }
     }
   }
@@ -1135,7 +1112,7 @@ public class TestFsck {
     String outStr = runFsck(conf, 0, false, "/corruptData",
         "-list-corruptfileblocks");
     System.out.println("1. good fsck out: " + outStr);
-    assertTrue(outStr.contains("has 0 CORRUPT files"));
+    assertTrue(outStr.contains("has 0 CORRUPT blocks"));
     // delete the blocks
     final String bpid = cluster.getNamesystem().getBlockPoolId();
     for (int i=0; i<4; i++) {
@@ -1158,19 +1135,19 @@ public class TestFsck {
     waitForCorruptionBlocks(3, "/corruptData");
     outStr = runFsck(conf, -1, true, "/corruptData", "-list-corruptfileblocks");
     System.out.println("2. bad fsck out: " + outStr);
-    assertTrue(outStr.contains("has 3 CORRUPT files"));
+    assertTrue(outStr.contains("has 3 CORRUPT blocks"));
 
     // Do a listing on a dir which doesn't have any corrupt blocks and validate
     util.createFiles(fs, "/goodData");
     outStr = runFsck(conf, 0, true, "/goodData", "-list-corruptfileblocks");
     System.out.println("3. good fsck out: " + outStr);
-    assertTrue(outStr.contains("has 0 CORRUPT files"));
+    assertTrue(outStr.contains("has 0 CORRUPT blocks"));
     util.cleanup(fs, "/goodData");
 
     // validate if a directory have any invalid entries
     util.createFiles(fs, "/corruptDa");
     outStr = runFsck(conf, 0, true, "/corruptDa", "-list-corruptfileblocks");
-    assertTrue(outStr.contains("has 0 CORRUPT files"));
+    assertTrue(outStr.contains("has 0 CORRUPT blocks"));
     util.cleanup(fs, "/corruptData");
     util.cleanup(fs, "/corruptDa");
   }
@@ -1412,7 +1389,6 @@ public class TestFsck {
     util.waitReplication(fs, fileName, (short)3);
     long aTime = fc.getFileStatus(symlink).getAccessTime();
     Thread.sleep(precision);
-    setupAuditLogs();
     String outStr = runFsck(conf, 0, true, "/");
     verifyAuditLogs();
     assertEquals(aTime, fc.getFileStatus(symlink).getAccessTime());
@@ -2056,7 +2032,6 @@ public class TestFsck {
     long replTime = fs.getFileStatus(replFilePath).getAccessTime();
     long ecTime = fs.getFileStatus(largeFilePath).getAccessTime();
     Thread.sleep(precision);
-    setupAuditLogs();
     String outStr = runFsck(conf, 0, true, "/");
     verifyAuditLogs();
     assertEquals(replTime, fs.getFileStatus(replFilePath).getAccessTime());
@@ -2119,7 +2094,7 @@ public class TestFsck {
     String outStr =
         runFsck(conf, 0, false, "/corruptData", "-list-corruptfileblocks");
     System.out.println("1. good fsck out: " + outStr);
-    assertTrue(outStr.contains("has 0 CORRUPT files"));
+    assertTrue(outStr.contains("has 0 CORRUPT blocks"));
     // delete the blocks
     final String bpid = cluster.getNamesystem().getBlockPoolId();
     for (int i=0; i<numFiles; i++) {
@@ -2149,14 +2124,14 @@ public class TestFsck {
         "-list-corruptfileblocks", "-includeSnapshots");
     System.out.println("2. bad fsck include snapshot out: " + outStr);
     assertTrue(outStr
-        .contains("has " + (numFiles + numSnapshots) + " CORRUPT files"));
+        .contains("has " + (numFiles + numSnapshots) + " CORRUPT blocks"));
     assertTrue(outStr.contains("/.snapshot/"));
 
     // without -includeSnapshots only non-snapshots are reported
     outStr =
         runFsck(conf, -1, true, "/corruptData", "-list-corruptfileblocks");
     System.out.println("3. bad fsck exclude snapshot out: " + outStr);
-    assertTrue(outStr.contains("has " + numFiles + " CORRUPT files"));
+    assertTrue(outStr.contains("has " + numFiles + " CORRUPT blocks"));
     assertFalse(outStr.contains("/.snapshot/"));
   }
 
@@ -2215,7 +2190,7 @@ public class TestFsck {
         new InetSocketAddress("localhost", cluster.getNameNodePort()), conf);
     final String blockFileToCorrupt = fileNames[0];
     final CorruptedTestFile ctf = new CorruptedTestFile(blockFileToCorrupt,
-        Sets.newHashSet(0), dfsClient, numDatanodes, dfsBlockSize);
+        new HashSet<>(Arrays.asList(0)), dfsClient, numDatanodes, dfsBlockSize);
     ctf.corruptBlocks(cluster);
 
     // Wait for fsck to discover all the missing blocks
@@ -2310,7 +2285,7 @@ public class TestFsck {
       dnProp.setPort(datanodeID.getXferPort());
       dnProp.setUpgradeDomain(upgradeDomain);
       hostsFileWriter.initIncludeHosts(new DatanodeAdminProperties[]{dnProp});
-      cluster.getFileSystem().refreshNodes();
+      cluster.getNamesystem(0).getBlockManager().getDatanodeManager().refreshNodes(conf);
     }
 
     // create files
@@ -2402,7 +2377,7 @@ public class TestFsck {
     assertTrue(outStr.contains(NamenodeFsck.CORRUPT_STATUS));
     assertTrue(outStr.contains("Under-erasure-coded block groups:\t0"));
     outStr = runFsck(conf, -1, true, "/", "-list-corruptfileblocks");
-    assertTrue(outStr.contains("has 1 CORRUPT files"));
+    assertTrue(outStr.contains("has 1 CORRUPT blocks"));
   }
 
   @Test (timeout = 300000)
@@ -2447,7 +2422,69 @@ public class TestFsck {
     assertTrue(outStr.contains("Live_repl=" + (dataBlocks - 1)));
     assertTrue(outStr.contains("Under-erasure-coded block groups:\t0"));
     outStr = runFsck(conf, -1, true, "/", "-list-corruptfileblocks");
-    assertTrue(outStr.contains("has 1 CORRUPT files"));
+    assertTrue(outStr.contains("has 1 CORRUPT blocks"));
+  }
+
+  @Test
+  public void testFsckECBlockIdRedundantInternalBlocks() throws Exception {
+    final int dataBlocks = StripedFileTestUtil.getDefaultECPolicy().getNumDataUnits();
+    final int parityBlocks = StripedFileTestUtil.getDefaultECPolicy().getNumParityUnits();
+    final int cellSize = StripedFileTestUtil.getDefaultECPolicy().getCellSize();
+    final short groupSize = (short) (dataBlocks + parityBlocks);
+    final File builderBaseDir = new File(GenericTestUtils.getRandomizedTempPath());
+    final Path dirPath = new Path("/ec_dir");
+    final Path filePath = new Path(dirPath, "file");
+
+    conf.setInt(DFSConfigKeys.DFS_NAMENODE_REDUNDANCY_INTERVAL_SECONDS_KEY, 1);
+    cluster = new MiniDFSCluster.Builder(conf, builderBaseDir).numDataNodes(groupSize + 1).build();
+    cluster.waitActive();
+
+    DistributedFileSystem fs = cluster.getFileSystem();
+    fs.enableErasureCodingPolicy(
+        StripedFileTestUtil.getDefaultECPolicy().getName());
+
+    try {
+      fs.mkdirs(dirPath);
+      fs.setErasureCodingPolicy(dirPath, StripedFileTestUtil.getDefaultECPolicy().getName());
+      DFSTestUtil.createFile(fs, filePath, cellSize * dataBlocks * 2, (short) 1, 0L);
+      LocatedBlocks blks = fs.getClient().getLocatedBlocks(filePath.toString(), 0);
+      LocatedStripedBlock block = (LocatedStripedBlock) blks.getLastLocatedBlock();
+      Assert.assertEquals(groupSize, block.getLocations().length);
+
+      //general test.
+      String runFsckResult = runFsck(conf, 0, true, "/",
+          "-blockId", block.getBlock().getBlockName());
+      assertTrue(runFsckResult.contains(block.getBlock().getBlockName()));
+      assertTrue(runFsckResult.contains("No. of Expected Replica: " + groupSize));
+      assertTrue(runFsckResult.contains("No. of live Replica: " + groupSize));
+      assertTrue(runFsckResult.contains("No. of redundant Replica: " + 0));
+
+      // stop a dn.
+      DatanodeInfo dnToStop = block.getLocations()[0];
+      MiniDFSCluster.DataNodeProperties dnProp = cluster.stopDataNode(dnToStop.getXferAddr());
+      cluster.setDataNodeDead(dnToStop);
+
+      // wait for reconstruction to happen.
+      DFSTestUtil.waitForReplication(fs, filePath, groupSize, 15 * 1000);
+
+      // bring the dn back: 10 internal blocks now.
+      cluster.restartDataNode(dnProp);
+      cluster.waitActive();
+
+      blks = fs.getClient().getLocatedBlocks(filePath.toString(), 0);
+      block = (LocatedStripedBlock) blks.getLastLocatedBlock();
+      Assert.assertEquals(groupSize + 1, block.getLocations().length);
+
+      //general test, number of redundant internal block replicas.
+      runFsckResult = runFsck(conf, 0, true, "/",
+          "-blockId", block.getBlock().getBlockName());
+      assertTrue(runFsckResult.contains(block.getBlock().getBlockName()));
+      assertTrue(runFsckResult.contains("No. of Expected Replica: " + groupSize));
+      assertTrue(runFsckResult.contains("No. of live Replica: " + groupSize));
+      assertTrue(runFsckResult.contains("No. of redundant Replica: " + 1));
+    } finally {
+      cluster.shutdown();
+    }
   }
 
   private void waitForUnrecoverableBlockGroup(Configuration configuration)
@@ -2510,13 +2547,17 @@ public class TestFsck {
     ugi.doAs(new PrivilegedExceptionAction<Void>() {
        @Override
         public Void run() throws Exception {
-         String path = "/";
-         String outStr = runFsck(conf, -1, true, path, "-list-corruptfileblocks");
+        String path = "/";
+        String outStr =
+            runFsck(conf, -1, true, path, "-list-corruptfileblocks");
 
-         assertFalse(outStr.contains("The list of corrupt files under path '" + path + "' are:"));
-         assertFalse(outStr.contains("The filesystem under path '" + path + "' has "));
-         assertTrue(outStr.contains("Failed to open path '" + path + "': Permission denied"));
-         return null;
+        assertFalse(outStr.contains(
+            "The list of corrupt blocks under path '" + path + "' are:"));
+        assertFalse(
+            outStr.contains("The filesystem under path '" + path + "' has "));
+        assertTrue(outStr
+            .contains("Failed to open path '" + path + "': Permission denied"));
+        return null;
        }
       });
   }

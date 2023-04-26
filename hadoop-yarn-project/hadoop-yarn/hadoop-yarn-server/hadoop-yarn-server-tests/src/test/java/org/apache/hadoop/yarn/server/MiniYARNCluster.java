@@ -41,8 +41,10 @@ import org.apache.hadoop.security.token.Token;
 import org.apache.hadoop.net.ServerSocketUtil;
 import org.apache.hadoop.service.AbstractService;
 import org.apache.hadoop.service.CompositeService;
+import org.apache.hadoop.test.GenericTestUtils;
 import org.apache.hadoop.util.Shell;
 import org.apache.hadoop.util.Shell.ShellCommandExecutor;
+import org.apache.hadoop.util.Time;
 import org.apache.hadoop.yarn.api.protocolrecords.GetClusterMetricsRequest;
 import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
 import org.apache.hadoop.yarn.conf.HAUtil;
@@ -97,7 +99,7 @@ import org.apache.hadoop.yarn.util.resource.ResourceUtils;
 import org.apache.hadoop.yarn.util.timeline.TimelineUtils;
 import org.apache.hadoop.yarn.webapp.util.WebAppUtils;
 
-import org.apache.hadoop.thirdparty.com.google.common.annotations.VisibleForTesting;
+import org.apache.hadoop.classification.VisibleForTesting;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -171,8 +173,11 @@ public class MiniYARNCluster extends CompositeService {
     this.numLocalDirs = numLocalDirs;
     this.numLogDirs = numLogDirs;
     this.enableAHS = enableAHS;
-    String testSubDir = testName.replace("$", "");
-    File targetWorkDir = new File("target", testSubDir);
+    String yarnFolderName = String.format("yarn-%d", Time.monotonicNow());
+    File targetWorkDirRoot = GenericTestUtils.getTestDir(getName());
+    // make sure that the folder exists
+    targetWorkDirRoot.mkdirs();
+    File targetWorkDir = new File(targetWorkDirRoot, yarnFolderName);
     try {
       FileContext.getLocalFSFileContext().delete(
           new Path(targetWorkDir.getAbsolutePath()), true);
@@ -227,6 +232,7 @@ public class MiniYARNCluster extends CompositeService {
    * @param numLocalDirs the number of nm-local-dirs per nodemanager
    * @param numLogDirs the number of nm-log-dirs per nodemanager
    */
+  @SuppressWarnings("deprecation")
   public MiniYARNCluster(
       String testName, int numResourceManagers, int numNodeManagers,
       int numLocalDirs, int numLogDirs) {
@@ -896,8 +902,8 @@ public class MiniYARNCluster extends CompositeService {
         LOG.info("CustomAMRMProxyService is enabled. "
             + "All the AM->RM requests will be intercepted by the proxy");
         AMRMProxyService amrmProxyService =
-            useRpc ? new AMRMProxyService(getContext(), dispatcher)
-                : new ShortCircuitedAMRMProxy(getContext(), dispatcher);
+            useRpc ? new AMRMProxyService(getContext(), getDispatcher())
+                : new ShortCircuitedAMRMProxy(getContext(), getDispatcher());
         this.setAMRMProxyService(amrmProxyService);
         addService(this.getAMRMProxyService());
       } else {
@@ -928,8 +934,8 @@ public class MiniYARNCluster extends CompositeService {
         LOG.info("CustomAMRMProxyService is enabled. "
             + "All the AM->RM requests will be intercepted by the proxy");
         AMRMProxyService amrmProxyService =
-            useRpc ? new AMRMProxyService(getContext(), dispatcher)
-                : new ShortCircuitedAMRMProxy(getContext(), dispatcher);
+            useRpc ? new AMRMProxyService(getContext(), getDispatcher())
+                : new ShortCircuitedAMRMProxy(getContext(), getDispatcher());
         this.setAMRMProxyService(amrmProxyService);
         addService(this.getAMRMProxyService());
       } else {
@@ -940,7 +946,7 @@ public class MiniYARNCluster extends CompositeService {
     @Override
     protected ContainersMonitor createContainersMonitor(ContainerExecutor
         exec) {
-      return new ContainersMonitorImpl(exec, dispatcher, this.context) {
+      return new ContainersMonitorImpl(exec, getDispatcher(), this.context) {
         @Override
         public float getVmemRatio() {
           return 2.0f;

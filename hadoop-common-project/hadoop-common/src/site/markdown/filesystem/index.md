@@ -32,6 +32,8 @@ HDFS as these are commonly expected by Hadoop client applications.
 1. [Notation](notation.html)
 1. [Model](model.html)
 1. [FileSystem class](filesystem.html)
+1. [OutputStream, Syncable and `StreamCapabilities`](outputstream.html)
+1. [Abortable](abortable.html)
 1. [FSDataInputStream class](fsdatainputstream.html)
 1. [PathCapabilities interface](pathcapabilities.html)
 1. [FSDataOutputStreamBuilder class](fsdataoutputstreambuilder.html)
@@ -39,3 +41,4 @@ HDFS as these are commonly expected by Hadoop client applications.
 2. [Extending the specification and its tests](extending.html)
 1. [Uploading a file using Multiple Parts](multipartuploader.html)
 1. [IOStatistics](iostatistics.html)
+1. [openFile()](openfile.html).

@@ -30,8 +30,8 @@ import org.apache.hadoop.fs.StreamCapabilities;
 import org.apache.hadoop.fs.Syncable;
 import org.apache.hadoop.fs.statistics.IOStatistics;
 import org.apache.hadoop.fs.statistics.IOStatisticsSource;
-
-import org.apache.hadoop.thirdparty.com.google.common.base.Preconditions;
+import org.apache.hadoop.fs.impl.StoreImplementationUtils;
+import org.apache.hadoop.util.Preconditions;
 
 import static org.apache.hadoop.fs.statistics.IOStatisticsSupport.retrieveIOStatistics;
 
@@ -146,7 +146,7 @@ public class CryptoOutputStream extends FilterOutputStream implements
    * @param b the data.
    * @param off the start offset in the data.
    * @param len the number of bytes to write.
-   * @throws IOException
+   * @throws IOException raised on errors performing I/O.
    */
   @Override
   public synchronized void write(byte[] b, int off, int len) throws IOException {
@@ -241,12 +241,15 @@ public class CryptoOutputStream extends FilterOutputStream implements
       return;
     }
     try {
-      flush();
-      if (closeOutputStream) {
-        super.close();
-        codec.close();
+      try {
+        flush();
+      } finally {
+        if (closeOutputStream) {
+          super.close();
+          codec.close();
+        }
+        freeBuffers();
       }
-      freeBuffers();
     } finally {
       closed = true;
     }
@@ -312,10 +315,7 @@ public class CryptoOutputStream extends FilterOutputStream implements
 
   @Override
   public boolean hasCapability(String capability) {
-    if (out instanceof StreamCapabilities) {
-      return ((StreamCapabilities) out).hasCapability(capability);
-    }
-    return false;
+    return StoreImplementationUtils.hasCapability(out, capability);
   }
 
   @Override

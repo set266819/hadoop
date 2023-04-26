@@ -16,19 +16,23 @@
 
 package org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.converter;
 
+import static org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacitySchedulerConfiguration.AUTO_QUEUE_CREATION_V2_ENABLED;
+import static org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacitySchedulerConfiguration.DEFAULT_AUTO_QUEUE_CREATION_ENABLED;
 import static org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacitySchedulerConfiguration.PREFIX;
+import static org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacitySchedulerConfiguration.DOT;
+import static org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacitySchedulerConfiguration.USER_LIMIT_FACTOR;
 
-import java.math.BigDecimal;
 import java.util.List;
-import java.util.Map;
 import java.util.stream.Collectors;
 
-import org.apache.commons.lang3.tuple.Pair;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.yarn.api.records.Resource;
+import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacitySchedulerConfiguration;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.ConfigurableResource;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.FSLeafQueue;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.FSQueue;
+import org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.converter.weightconversion.CapacityConverter;
+import org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.converter.weightconversion.CapacityConverterFactory;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.policies.DominantResourceFairnessPolicy;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.policies.FairSharePolicy;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.policies.FifoPolicy;
@@ -54,6 +58,7 @@ public class FSQueueConverter {
   private final float queueMaxAMShareDefault;
   private final int queueMaxAppsDefault;
   private final boolean drfUsed;
+  private final boolean usePercentages;
 
   private ConversionOptions conversionOptions;
 
@@ -67,6 +72,7 @@ public class FSQueueConverter {
     this.queueMaxAppsDefault = builder.queueMaxAppsDefault;
     this.conversionOptions = builder.conversionOptions;
     this.drfUsed = builder.drfUsed;
+    this.usePercentages = builder.usePercentages;
   }
 
   public void convertQueueHierarchy(FSQueue queue) {
@@ -84,6 +90,7 @@ public class FSQueueConverter {
     emitSizeBasedWeight(queueName);
     emitOrderingPolicy(queueName, queue);
     checkMaxChildCapacitySetting(queue);
+    emitDefaultUserLimitFactor(queueName, children);
 
     for (FSQueue childQueue : children) {
       convertQueueHierarchy(childQueue);
@@ -214,6 +221,15 @@ public class FSQueueConverter {
     }
   }
 
+  public void emitDefaultUserLimitFactor(String queueName, List<FSQueue> children) {
+    if (children.isEmpty() && checkAutoQueueCreationV2Disabled(queueName)) {
+      capacitySchedulerConfig.setFloat(
+              CapacitySchedulerConfiguration.
+                      PREFIX + queueName + DOT + USER_LIMIT_FACTOR,
+              -1.0f);
+    }
+  }
+
   /**
    * yarn.scheduler.fair.sizebasedweight ==>
    * yarn.scheduler.capacity.&lt;queue-path&gt;
@@ -267,24 +283,14 @@ public class FSQueueConverter {
    * @param queue
    */
   private void emitChildCapacity(FSQueue queue) {
-    List<FSQueue> children = queue.getChildQueues();
+    CapacityConverter converter =
+        CapacityConverterFactory.getConverter(usePercentages);
 
-    int totalWeight = getTotalWeight(children);
-    Pair<Map<String, BigDecimal>, Boolean> result =
-        WeightToCapacityConversionUtil.getCapacities(
-            totalWeight, children, ruleHandler);
+    converter.convertWeightsForChildQueues(queue,
+        capacitySchedulerConfig);
 
-    Map<String, BigDecimal> capacities = result.getLeft();
-    boolean shouldAllowZeroSumCapacity = result.getRight();
-
-    capacities
-        .forEach((key, value) -> capacitySchedulerConfig.set(PREFIX + key +
-                ".capacity", value.toString()));
-
-    if (shouldAllowZeroSumCapacity) {
-      String queueName = queue.getName();
-      capacitySchedulerConfig.setBoolean(
-          PREFIX + queueName + ".allow-zero-capacity-sum", true);
+    if (Resources.none().compareTo(queue.getMinShare()) != 0) {
+      ruleHandler.handleMinResources();
     }
   }
 
@@ -305,12 +311,10 @@ public class FSQueueConverter {
     }
   }
 
-  private int getTotalWeight(List<FSQueue> children) {
-    double sum = children
-                  .stream()
-                  .mapToDouble(c -> c.getWeight())
-                  .sum();
-    return (int) sum;
+  private boolean checkAutoQueueCreationV2Disabled(String queueName) {
+    return !capacitySchedulerConfig.getBoolean(
+        PREFIX + queueName + DOT + AUTO_QUEUE_CREATION_V2_ENABLED,
+        DEFAULT_AUTO_QUEUE_CREATION_ENABLED);
   }
 
   private String getQueueShortName(String queueName) {
